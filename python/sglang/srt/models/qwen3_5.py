@@ -83,6 +83,10 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 
+
+def _is_mtp_or_nextn_weight(name: str) -> bool:
+    return "mtp" in name or ".nextn." in name
+
 cached_get_processor = lru_cache(get_processor)
 
 
@@ -1210,7 +1214,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-            if "mtp" in name:
+            if _is_mtp_or_nextn_weight(name):
+                logger.info_once(
+                    "Skipping qwen3.5 MTP/nextn weights during main model load."
+                )
                 continue
             if "visual" in name:
                 continue
@@ -1361,7 +1368,10 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-            if "mtp" in name:
+            if _is_mtp_or_nextn_weight(name):
+                logger.info_once(
+                    "Skipping qwen3.5 MTP/nextn weights during main model load."
+                )
                 continue
             if "visual" in name:
                 continue
@@ -1559,7 +1569,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-            if "mtp" in name:
+            if _is_mtp_or_nextn_weight(name):
+                logger.info_once(
+                    "Skipping qwen3.5 MTP/nextn weights during main model load."
+                )
                 continue
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
@@ -1719,7 +1732,10 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-            if "mtp" in name:
+            if _is_mtp_or_nextn_weight(name):
+                logger.info_once(
+                    "Skipping qwen3.5 MTP/nextn weights during main model load."
+                )
                 continue
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")

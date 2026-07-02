@@ -14,6 +14,13 @@ _TOP_LEVEL = {
     "nextn.eh_norm.weight": "model.mtp.eh_norm.weight",
 }
 
+_NEXTN_SUFFIXES = {
+    "nextn.eh_proj.weight": "model.mtp.eh_proj.weight",
+    "nextn.enorm.weight": "model.mtp.enorm.weight",
+    "nextn.hnorm.weight": "model.mtp.hnorm.weight",
+    "nextn.shared_head_norm.weight": "model.mtp.shared_head_norm.weight",
+}
+
 _BLOCK_SUFFIXES = {
     "attn_norm.weight": "attn_norm.weight",
     "post_attention_norm.weight": "ffn_norm.weight",
@@ -74,6 +81,8 @@ def qwen35moe_gguf_to_hf(gguf_name: str) -> Optional[str]:
         return None
 
     layer, suffix = match.groups()
+    if suffix in _NEXTN_SUFFIXES:
+        return _NEXTN_SUFFIXES[suffix]
     if suffix in _FUSED_EXPERT_TARGETS:
         return f"model.layers.{layer}.{_FUSED_EXPERT_TARGETS[suffix]}"
     target = _BLOCK_SUFFIXES.get(suffix)
@@ -107,6 +116,9 @@ def make_qwen35moe_gguf_map(
             out[f"blk.{layer}.ffn_gate_exps.{exp}.weight"] = f"model.layers.{layer}.mlp.experts.{exp}.gate_proj.weight"
             out[f"blk.{layer}.ffn_up_exps.{exp}.weight"] = f"model.layers.{layer}.mlp.experts.{exp}.up_proj.weight"
             out[f"blk.{layer}.ffn_down_exps.{exp}.weight"] = f"model.layers.{layer}.mlp.experts.{exp}.down_proj.weight"
+    nextn_layer = num_hidden_layers
+    for suffix, hf_name in _NEXTN_SUFFIXES.items():
+        out[f"blk.{nextn_layer}.{suffix}"] = hf_name
     return out
 
 

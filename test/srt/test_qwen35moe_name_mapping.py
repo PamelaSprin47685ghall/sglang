@@ -34,6 +34,10 @@ KNOWN_MAP = [
     ("blk.0.ffn_gate_exps.weight", "model.layers.0.mlp.experts.gate_proj.weight"),
     ("blk.0.ffn_up_exps.weight", "model.layers.0.mlp.experts.up_proj.weight"),
     ("blk.0.ffn_down_exps.weight", "model.layers.0.mlp.experts.down_proj.weight"),
+    ("blk.40.nextn.eh_proj.weight", "model.mtp.eh_proj.weight"),
+    ("blk.40.nextn.enorm.weight", "model.mtp.enorm.weight"),
+    ("blk.40.nextn.hnorm.weight", "model.mtp.hnorm.weight"),
+    ("blk.40.nextn.shared_head_norm.weight", "model.mtp.shared_head_norm.weight"),
     ("blk.0.ffn_gate_inp_shexp.weight", "model.layers.0.mlp.shared_expert.gate.weight"),
     ("blk.0.ffn_gate_shexp.weight", "model.layers.0.mlp.shared_expert.gate_proj.weight"),
     ("blk.0.ffn_down_shexp.weight", "model.layers.0.mlp.shared_expert.down_proj.weight"),
@@ -113,7 +117,7 @@ def test_make_qwen35moe_gguf_map_covers_non_expert_layers():
         num_attention_heads=8,
     )
     for gg, expected in KNOWN_MAP:
-        if "nextn" in gg or any(gg.startswith(f"blk.{layer}.") for layer in (0, 1)):
+        if any(gg.startswith(f"blk.{layer}.") for layer in (0, 1)):
             assert m.get(gg) == expected, f"{gg} → {m.get(gg)} != {expected}"
 
 
@@ -134,6 +138,10 @@ def test_make_qwen35moe_gguf_map_experts_are_flat_per_expert():
     assert m["blk.0.ffn_gate_exps.weight"] == "model.layers.0.mlp.experts.gate_proj.weight"
     assert m["blk.0.ffn_up_exps.weight"] == "model.layers.0.mlp.experts.up_proj.weight"
     assert m["blk.0.ffn_down_exps.weight"] == "model.layers.0.mlp.experts.down_proj.weight"
+    assert m["blk.2.nextn.eh_proj.weight"] == "model.mtp.eh_proj.weight"
+    assert m["blk.2.nextn.enorm.weight"] == "model.mtp.enorm.weight"
+    assert m["blk.2.nextn.hnorm.weight"] == "model.mtp.hnorm.weight"
+    assert m["blk.2.nextn.shared_head_norm.weight"] == "model.mtp.shared_head_norm.weight"
 
 
 # ---- loader hook 测试 (依赖 sglang) ----

@@ -118,6 +118,31 @@ def test_iterator_conv1d_matches_export_v_reorder():
     assert torch.allclose(w.float(), ref.float(), atol=1e-5)
 
 
+def test_layer3_attn_q_q6k_fused_matches_dequant():
+    import numpy as np
+    from gguf import GGUFReader
+
+    from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
+
+    if not torch.cuda.is_available():
+        return
+    path = "/home/kunweiz/Desktop/Ornith/ornith-gguf-runtime/ornith-gpu-non-expert.gguf"
+    gt = "blk.3.attn_q.weight"
+    t = next(x for x in GGUFReader(path).tensors if x.name == gt)
+    raw = torch.tensor(np.array(t.data)).cuda()
+    qt = int(t.tensor_type)
+    dense = (
+        torch.from_numpy(np.array(gguf.dequantize(np.array(t.data), t.tensor_type)))
+        .float()
+        .cuda()
+    )
+    assert dense.shape == (8192, 2048)
+    x = torch.randn(2, 2048, dtype=torch.float16, device="cuda")
+    y = fused_mul_mat_gguf(x, raw, qt)
+    y_ref = x.float() @ dense.T
+    assert torch.allclose(y.float(), y_ref, atol=0.05, rtol=0.01)
+
+
 def test_out_proj_q6k_fused_matches_dense_with_activation_perm():
     import numpy as np
     from gguf import GGUFReader

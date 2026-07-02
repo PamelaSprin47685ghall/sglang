@@ -2081,10 +2081,43 @@ class GGUFModelLoader(BaseModelLoader):
             gguf_to_hf_name_map[f"{gguf_name}.{suffix}"] = hf_name
         return gguf_to_hf_name_map
 
+    def _qwen35_linear_attn_vcfg(self, model_config: ModelConfig):
+        from sglang.srt.model_loader.gguf_qwen35moe import qwen35moe_linear_attn_vcfg
+        from sglang.srt.model_loader.gguf_qwen35moe_hook import (
+            _extract_qwen35moe_params,
+            _is_qwen35moe_config,
+        )
+
+        if not _is_qwen35moe_config(model_config):
+            return None
+        params = _extract_qwen35moe_params(model_config)
+        if params is None or params.get("linear_num_key_heads") is None:
+            return None
+        return qwen35moe_linear_attn_vcfg(
+            linear_num_key_heads=params["linear_num_key_heads"],
+            linear_num_value_heads=params["linear_num_value_heads"],
+            linear_key_head_dim=params["linear_key_head_dim"],
+            linear_value_head_dim=params["linear_value_head_dim"],
+        )
+
     def _get_weights_iterator(
-        self, model_name_or_path: str, gguf_to_hf_name_map: Dict[str, str]
+        self,
+        model_name_or_path: str,
+        gguf_to_hf_name_map: Dict[str, str],
+        model_config: Optional[ModelConfig] = None,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-        return gguf_quant_weights_iterator(model_name_or_path, gguf_to_hf_name_map)
+        vcfg = (
+            self._qwen35_linear_attn_vcfg(model_config) if model_config else None
+        )
+        dense_dtype = (
+            model_config.dtype if model_config is not None else torch.bfloat16
+        )
+        return gguf_quant_weights_iterator(
+            model_name_or_path,
+            gguf_to_hf_name_map,
+            qwen35_linear_attn_vcfg=vcfg,
+            qwen35_dense_storage_dtype=dense_dtype,
+        )
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(model_config.model_path)
@@ -2110,7 +2143,9 @@ class GGUFModelLoader(BaseModelLoader):
             with target_device:
                 model = _initialize_model(model_config, self.load_config, quant_config)
             model.load_weights(
-                self._get_weights_iterator(local_model_path, gguf_weights_map)
+                self._get_weights_iterator(
+                    local_model_path, gguf_weights_map, model_config
+                )
             )
 
             for _, module in model.named_modules():

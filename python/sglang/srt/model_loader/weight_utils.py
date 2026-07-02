@@ -967,7 +967,10 @@ def get_gguf_extra_tensor_names(
 
 
 def gguf_quant_weights_iterator(
-    gguf_file: str, gguf_to_hf_name_map: Dict[str, str]
+    gguf_file: str,
+    gguf_to_hf_name_map: Dict[str, str],
+    qwen35_linear_attn_vcfg: Optional[Dict[str, int]] = None,
+    qwen35_dense_storage_dtype: Optional[torch.dtype] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate GGUF tensors and yield HF-named torch tensors for SGLang load."""
 
@@ -976,12 +979,17 @@ def gguf_quant_weights_iterator(
     reader = gguf.GGUFReader(gguf_file)
     tensor_names = {t.name for t in reader.tensors}
 
+    _qwen35_f32 = None
+    _qwen35_dequant_apply = None
+    _qwen35_needs_transform = None
     try:
         from sglang.srt.model_loader.gguf_qwen35moe import (
             apply_f32_transforms as _qwen35_f32,
+            qwen35_gguf_dequant_apply_for_load as _qwen35_dequant_apply,
+            qwen35moe_gguf_on_the_fly_needs_hf_transform as _qwen35_needs_transform,
         )
     except Exception:
-        _qwen35_f32 = None
+        pass
 
     gate_exps: Dict[str, torch.Tensor] = {}
     for tensor in reader.tensors:
@@ -1008,6 +1016,33 @@ def gguf_quant_weights_iterator(
         # via GGUFLoader mmap — skip them here to avoid double-loading into
         # GPU memory.
         if is_moe_expert:
+            continue
+
+        if (
+            qwen35_linear_attn_vcfg is not None
+            and _qwen35_needs_transform is not None
+            and _qwen35_dequant_apply is not None
+            and weight_type.name != "F32"
+            and _qwen35_needs_transform(name, qwen35_linear_attn_vcfg)
+        ):
+            raw = np.asarray(weight, dtype=np.uint8)
+            dense = torch.from_numpy(gguf.dequantize(raw, weight_type)).float()
+            param = _qwen35_dequant_apply(dense, name, qwen35_linear_attn_vcfg)
+            store_dtype = qwen35_dense_storage_dtype or torch.bfloat16
+            param = param.to(store_dtype)
+            qname = name.replace("weight", "qweight")
+            if store_dtype == torch.bfloat16:
+                unquant_type = gguf.GGMLQuantizationType.BF16
+            else:
+                unquant_type = gguf.GGMLQuantizationType.F16
+            type_tensor = torch.tensor(unquant_type)
+            if name.endswith("linear_attn.in_proj_qkv.weight"):
+                type_name = qname.replace("qweight", "qweight_type")
+                for _ in range(3):
+                    yield type_name, type_tensor
+            else:
+                yield qname.replace("qweight", "qweight_type"), type_tensor
+            yield qname, param
             continue
 
         if weight_type.name != "F32":

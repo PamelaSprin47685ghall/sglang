@@ -33,6 +33,11 @@ def _extract_qwen35moe_params(model_config: Any) -> Optional[Dict[str, Any]]:
     if hidden_size is None or num_layers is None:
         return None
 
+    linear_num_key_heads = getattr(text_cfg, "linear_num_key_heads", None)
+    linear_num_value_heads = getattr(text_cfg, "linear_num_value_heads", None)
+    linear_key_head_dim = getattr(text_cfg, "linear_key_head_dim", None)
+    linear_value_head_dim = getattr(text_cfg, "linear_value_head_dim", None)
+
     return {
         "num_hidden_layers": num_layers,
         "num_experts": num_experts or 1,
@@ -43,6 +48,10 @@ def _extract_qwen35moe_params(model_config: Any) -> Optional[Dict[str, Any]]:
         "num_key_value_heads": num_key_value_heads or 1,
         "num_attention_heads": num_attention_heads or 1,
         "num_expert_shared": num_expert_shared or 1,
+        "linear_num_key_heads": linear_num_key_heads,
+        "linear_num_value_heads": linear_num_value_heads,
+        "linear_key_head_dim": linear_key_head_dim,
+        "linear_value_head_dim": linear_value_head_dim,
     }
 
 
@@ -74,7 +83,15 @@ def install_gguf_qwen35moe() -> None:
                 logger.info("Activating qwen35moe GGUF name-map hook.")
                 from sglang.srt.model_loader.gguf_qwen35moe import make_qwen35moe_gguf_map
 
-                return make_qwen35moe_gguf_map(**params)
+                map_params = dict(params)
+                for k in (
+                    "linear_num_key_heads",
+                    "linear_num_value_heads",
+                    "linear_key_head_dim",
+                    "linear_value_head_dim",
+                ):
+                    map_params.pop(k, None)
+                return make_qwen35moe_gguf_map(**map_params)
         return _original_get_gguf_weights_map(self, model_config)
 
     GGUFModelLoader._get_gguf_weights_map = _patched

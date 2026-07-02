@@ -224,6 +224,117 @@ def get_out_proj_activation_perm(num_v_per_k: int, k_heads: int, head_dim: int):
     )
 
 
+def qwen35moe_linear_attn_vcfg(
+    *,
+    linear_num_key_heads: int,
+    linear_num_value_heads: int,
+    linear_key_head_dim: int,
+    linear_value_head_dim: int,
+) -> dict:
+    k_heads = int(linear_num_key_heads)
+    v_heads = int(linear_num_value_heads)
+    return {
+        "k_heads": k_heads,
+        "num_v_per_k": v_heads // k_heads,
+        "num_value_heads": v_heads,
+        "head_k_dim": int(linear_key_head_dim),
+        "head_v_dim": int(linear_value_head_dim),
+    }
+
+
+_ON_THE_FLY_DEQUANT_SUFFIXES = (
+    ".in_proj_qkv.weight",
+    ".in_proj_z.weight",
+    ".in_proj_a.weight",
+    ".in_proj_b.weight",
+)
+
+
+def qwen35moe_gguf_on_the_fly_needs_hf_transform(hf_name: str, cfg: dict) -> bool:
+    if not _needs_v_head_reorder(hf_name, cfg):
+        return False
+    return any(hf_name.endswith(s) for s in _ON_THE_FLY_DEQUANT_SUFFIXES)
+
+
+def _qwen35_dequant_to_out_in_rows(w, hf_name: str, cfg: dict):
+    """gguf.dequantize often yields (in_features, out_features); loader rows are (out, in)."""
+    import torch
+
+    key_dim, value_dim, _ = _linear_attn_dims(cfg)
+    kh = int(cfg["k_heads"])
+    vpk = int(cfg["num_v_per_k"])
+    lead = key_dim * 2 + value_dim
+    n_ab = kh * vpk
+    if w.ndim != 2:
+        return w
+    if hf_name.endswith(".in_proj_qkv.weight"):
+        if w.shape[0] != lead and w.shape[1] == lead:
+            return w.t().contiguous()
+    if hf_name.endswith(".in_proj_z.weight"):
+        if w.shape[0] != value_dim and w.shape[1] == value_dim:
+            return w.t().contiguous()
+    if hf_name.endswith((".in_proj_a.weight", ".in_proj_b.weight")):
+        if w.shape[0] != n_ab and w.shape[1] == n_ab:
+            return w.t().contiguous()
+    return w
+
+
+def _qwen35_on_the_fly_linear_attn_qweight(w, hf_name: str, cfg: dict):
+    """GGUF dequant is (out_features, in_features); loader expects same layout as qweight rows."""
+    import torch
+
+    w = _qwen35_dequant_to_out_in_rows(w, hf_name, cfg)
+    key_dim, value_dim, _ = _linear_attn_dims(cfg)
+    vpk, kh, hvd = int(cfg["num_v_per_k"]), int(cfg["k_heads"]), int(cfg["head_v_dim"])
+    lead = key_dim * 2 + value_dim
+
+    if hf_name.endswith(".in_proj_qkv.weight"):
+        if w.ndim == 2 and w.shape[0] == lead:
+            tail = w.shape[1]
+            q = w[:key_dim]
+            k = w[key_dim : 2 * key_dim]
+            v = w[2 * key_dim : 2 * key_dim + value_dim]
+            v_g = (
+                v.reshape(vpk, kh, hvd, tail)
+                .permute(1, 0, 2, 3)
+                .reshape(value_dim, tail)
+            )
+            return torch.cat([q, k, v_g], dim=0).contiguous()
+        if w.ndim == 2 and w.shape[1] == lead:
+            return _v_reorder_dim1_segment(w, key_dim, value_dim, vpk, kh, hvd)
+        return w
+    if hf_name.endswith(".in_proj_z.weight") and w.ndim == 2 and w.shape[0] == value_dim:
+        tail = w.shape[1]
+        return (
+            w.reshape(vpk, kh, hvd, tail)
+            .permute(1, 0, 2, 3)
+            .reshape(value_dim, tail)
+            .contiguous()
+        )
+    if hf_name.endswith((".in_proj_a.weight", ".in_proj_b.weight")):
+        n = kh * vpk
+        if w.ndim == 2 and w.shape[0] == n:
+            tail = w.shape[1]
+            return (
+                w.reshape(vpk, kh, 1, tail)
+                .permute(1, 0, 2, 3)
+                .reshape(n, tail)
+                .contiguous()
+            )
+    return w
+
+
+def qwen35_gguf_dequant_apply_for_load(w, hf_name: str, cfg: dict):
+    import torch
+
+    dense = w.float() if isinstance(w, torch.Tensor) else torch.from_numpy(w).float()
+    return _qwen35_on_the_fly_linear_attn_qweight(dense, hf_name, cfg)
+
+
+def qwen35_col_linear_weight_to_loader_layout(hf_name: str, w):
+    return w
+
+
 def _is_rmsnorm_like(hf_name: str) -> bool:
     if "linear_attn.norm" in hf_name or "ssm_norm" in hf_name:
         return False

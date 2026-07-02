@@ -118,6 +118,32 @@ def test_iterator_conv1d_matches_export_v_reorder():
     assert torch.allclose(w.float(), ref.float(), atol=1e-5)
 
 
+def test_out_proj_q6k_fused_matches_dense_with_activation_perm():
+    import numpy as np
+    from gguf import GGUFReader
+
+    from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
+    from sglang.srt.model_loader.gguf_qwen35moe import get_out_proj_activation_perm
+
+    if not torch.cuda.is_available():
+        return
+    path = "/home/kunweiz/Desktop/Ornith/ornith-gguf-runtime/ornith-gpu-non-expert.gguf"
+    t = next(x for x in GGUFReader(path).tensors if x.name == "blk.0.ssm_out.weight")
+    raw = torch.tensor(np.array(t.data)).cuda()
+    qt = int(t.tensor_type)
+    dense = (
+        torch.from_numpy(np.array(gguf.dequantize(np.array(t.data), t.tensor_type)))
+        .float()
+        .cuda()
+    )
+    perm = get_out_proj_activation_perm(2, 16, 128).cuda()
+    x = torch.randn(2, 4096, dtype=torch.float16, device="cuda")
+    x_perm = x.index_select(-1, perm)
+    y_fused = fused_mul_mat_gguf(x_perm, raw, qt)
+    y_dense = x_perm.float() @ dense.T
+    assert torch.allclose(y_fused.float(), y_dense, atol=0.15, rtol=0.02)
+
+
 def test_in_proj_qkv_dim1_slices_transpose_for_linear_weight_layout():
     cfg = _vcfg()
     hidden = 2048

@@ -406,7 +406,17 @@ def get_config(
                 model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
             )
         except ValueError as e:
-            if "deepseek_ref" in str(e):
+            error_text = str(e)
+            if is_gguf and "GGUF model with architecture" in error_text and "not supported yet" in error_text:
+                retry_kwargs = dict(kwargs)
+                retry_kwargs.pop("gguf_file", None)
+                config = AutoConfig.from_pretrained(
+                    model,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **retry_kwargs,
+                )
+            elif "deepseek_ref" in error_text:
                 config = _load_deepseek_temp_model(
                     model,
                     model_type="deepseek_ref",
@@ -415,7 +425,7 @@ def get_config(
                     revision=revision,
                     **kwargs,
                 )
-            elif "deepseek_v32" in str(e):
+            elif "deepseek_v32" in error_text:
                 config = _load_deepseek_temp_model(
                     model,
                     model_type="deepseek_v32",
@@ -818,4 +828,3 @@ def get_rope_config(config):
     if rope_params is not None:
         return rope_params["rope_theta"], rope_params
     return getattr(config, "rope_theta", 10000), getattr(config, "rope_scaling", None)
-

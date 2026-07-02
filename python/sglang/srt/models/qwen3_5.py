@@ -1219,6 +1219,34 @@ class Qwen3_5ForCausalLM(nn.Module):
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
 
+            if ".mlp.experts.gate_proj.weight" in name:
+                load_fused_expert_weights(
+                    name.replace("experts.gate_proj.weight", "experts.w13_weight"),
+                    params_dict,
+                    loaded_weight,
+                    "w1",
+                    num_experts,
+                )
+                continue
+            if ".mlp.experts.up_proj.weight" in name:
+                load_fused_expert_weights(
+                    name.replace("experts.up_proj.weight", "experts.w13_weight"),
+                    params_dict,
+                    loaded_weight,
+                    "w3",
+                    num_experts,
+                )
+                continue
+            if ".mlp.experts.down_proj.weight" in name:
+                load_fused_expert_weights(
+                    name.replace("experts.down_proj.weight", "experts.w2_weight"),
+                    params_dict,
+                    loaded_weight,
+                    "w2",
+                    num_experts,
+                )
+                continue
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -1341,6 +1369,34 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+
+            if ".mlp.experts.gate_proj.weight" in name:
+                load_fused_expert_weights(
+                    name.replace("experts.gate_proj.weight", "experts.w13_weight"),
+                    params_dict,
+                    loaded_weight,
+                    "w1",
+                    num_experts,
+                )
+                continue
+            if ".mlp.experts.up_proj.weight" in name:
+                load_fused_expert_weights(
+                    name.replace("experts.up_proj.weight", "experts.w13_weight"),
+                    params_dict,
+                    loaded_weight,
+                    "w3",
+                    num_experts,
+                )
+                continue
+            if ".mlp.experts.down_proj.weight" in name:
+                load_fused_expert_weights(
+                    name.replace("experts.down_proj.weight", "experts.w2_weight"),
+                    params_dict,
+                    loaded_weight,
+                    "w2",
+                    num_experts,
+                )
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if "experts.gate_up_proj" in name or "experts.down_proj" in name:

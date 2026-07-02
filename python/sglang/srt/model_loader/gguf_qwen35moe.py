@@ -28,6 +28,7 @@ _BLOCK_SUFFIXES = {
     "attn_gate.weight": "linear_attn.in_proj_z.weight",
     "ssm_alpha.weight": "linear_attn.in_proj_a.weight",
     "ssm_beta.weight": "linear_attn.in_proj_b.weight",
+    "ssm_a": "linear_attn.ssm_a.weight",
     "ssm_a.weight": "linear_attn.ssm_a.weight",
     "ssm_dt.bias": "linear_attn.ssm_dt.bias",
     "ssm_conv1d.weight": "linear_attn.conv1d.weight",
@@ -47,10 +48,21 @@ _EXPERT_SUFFIXES = {
     "ffn_up_exps.weight",
 }
 
+_FUSED_EXPERT_TARGETS = {
+    "ffn_gate_exps.weight": "mlp.experts.gate_proj.weight",
+    "ffn_down_exps.weight": "mlp.experts.down_proj.weight",
+    "ffn_up_exps.weight": "mlp.experts.up_proj.weight",
+}
+
 
 def is_qwen35moe_expert(gguf_name: str) -> bool:
     match = _BLOCK_RE.match(gguf_name)
-    return bool(match and match.group(2) in _EXPERT_SUFFIXES)
+    if not match:
+        return False
+    suffix = match.group(2)
+    return suffix in _EXPERT_SUFFIXES or any(
+        suffix.startswith(prefix[:-7] + ".") for prefix in _EXPERT_SUFFIXES
+    )
 
 
 def qwen35moe_gguf_to_hf(gguf_name: str) -> Optional[str]:
@@ -62,6 +74,8 @@ def qwen35moe_gguf_to_hf(gguf_name: str) -> Optional[str]:
         return None
 
     layer, suffix = match.groups()
+    if suffix in _FUSED_EXPERT_TARGETS:
+        return f"model.layers.{layer}.{_FUSED_EXPERT_TARGETS[suffix]}"
     target = _BLOCK_SUFFIXES.get(suffix)
     if target is None:
         return None
@@ -86,6 +100,9 @@ def make_qwen35moe_gguf_map(
         for suffix, hf_suffix in _BLOCK_SUFFIXES.items():
             gguf_name = f"blk.{layer}.{suffix}"
             out[gguf_name] = f"model.layers.{layer}.{hf_suffix}"
+        out[f"blk.{layer}.ssm_a"] = f"model.layers.{layer}.linear_attn.ssm_a.weight"
+        for suffix, hf_suffix in _FUSED_EXPERT_TARGETS.items():
+            out[f"blk.{layer}.{suffix}"] = f"model.layers.{layer}.{hf_suffix}"
         for exp in range(num_experts):
             out[f"blk.{layer}.ffn_gate_exps.{exp}.weight"] = f"model.layers.{layer}.mlp.experts.{exp}.gate_proj.weight"
             out[f"blk.{layer}.ffn_up_exps.{exp}.weight"] = f"model.layers.{layer}.mlp.experts.{exp}.up_proj.weight"

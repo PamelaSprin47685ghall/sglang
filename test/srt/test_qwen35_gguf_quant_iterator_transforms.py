@@ -96,3 +96,23 @@ def test_iterator_yields_bf16_in_proj_qkv_for_layer0_slice():
     ).float()
     ref = qwen35_gguf_dequant_apply_for_load(ref_dense, hf, cfg)
     assert torch.allclose(w.float(), ref.t(), atol=1e-2, rtol=1e-2)
+
+
+def test_in_proj_qkv_dim1_slices_transpose_for_linear_weight_layout():
+    cfg = _vcfg()
+    hidden = 2048
+    key_dim = cfg["k_heads"] * cfg["head_k_dim"]
+    value_dim = cfg["num_value_heads"] * cfg["head_v_dim"]
+    lead = key_dim * 2 + value_dim
+    loaded = torch.randn(hidden, lead)
+    slices = (
+        (0, key_dim),
+        (key_dim, key_dim * 2),
+        (key_dim * 2, key_dim * 2 + value_dim),
+    )
+    for sl in slices:
+        piece = loaded[:, sl[0] : sl[1]].contiguous()
+        w = piece.t().contiguous()
+        assert w.shape[0] == sl[1] - sl[0]
+        assert w.shape[1] == hidden
+        torch.mm(torch.randn(4, hidden), w.t())

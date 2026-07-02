@@ -2147,7 +2147,10 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                             ):
                                 w_loader(
                                     param,
-                                    loaded_weight[:, sl[0] : sl[1]].contiguous(),
+                                    loaded_weight[:, sl[0] : sl[1]]
+                                    .contiguous()
+                                    .t()
+                                    .contiguous(),
                                     shard_id,
                                 )
                             loaded_params.add(name)

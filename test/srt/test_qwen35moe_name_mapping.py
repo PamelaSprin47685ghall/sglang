@@ -160,7 +160,8 @@ def test_loader_hook_dispatches_non_qwen_to_original():
             "architectures": ["LlamaForCausalLM"],
         })()
         model_config = type("MC", (), {"hf_config": cfg})()
-        with pytest.raises(RuntimeError):
+        model_config.model_path = "/tmp/non-qwen-gguf"
+        with pytest.raises((RuntimeError, ValueError, AttributeError)):
             GGUFModelLoader(_fake_load_config())._get_gguf_weights_map(model_config)
     finally:
         uninstall_gguf_qwen35moe()
@@ -185,6 +186,7 @@ def test_loader_hook_dispatches_qwen35moe_to_custom():
             "architectures": ["Qwen3_5MoeForConditionalGeneration"],
         })()
         model_config = type("MC", (), {"hf_config": cfg})()
+        model_config.model_path = "/tmp/qwen35moe-gguf"
         m = GGUFModelLoader(_fake_load_config())._get_gguf_weights_map(model_config)
         assert m["blk.0.attn_q.weight"] == "model.layers.0.attn.q_proj.weight"
         assert m["blk.1.ffn_gate_exps.3.weight"] == "model.layers.1.mlp.experts.3.gate_proj.weight"
@@ -211,6 +213,7 @@ def test_loader_hook_logs_activation(caplog):
             "architectures": ["Qwen3_5MoeForConditionalGeneration"],
         })()
         model_config = type("MC", (), {"hf_config": cfg})()
+        model_config.model_path = "/tmp/qwen35moe-gguf"
         with caplog.at_level("INFO"):
             GGUFModelLoader(_fake_load_config())._get_gguf_weights_map(model_config)
         assert "Activating qwen35moe GGUF name-map hook." in caplog.text

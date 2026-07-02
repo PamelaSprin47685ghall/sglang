@@ -96,7 +96,7 @@ def test_conv1d_reorder_shape_and_v_flip():
 
 
 def test_conv1d_reorder_pure():
-    w = torch.randn(4, 12)
+    w = torch.randn(4, 8)
     w_copy = w.clone()
     _ = conv1d_reorder(w, num_v_per_k=1, k_heads=2, head_dim=2)
     assert torch.equal(w, w_copy)

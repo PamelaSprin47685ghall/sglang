@@ -94,7 +94,7 @@ def make_qwen35moe_gguf_map(
 
 
 def norm_sub_one(w, hf_name: str):
-    if "linear_attn.norm" in hf_name:
+    if "linear_attn.norm" in hf_name or "ssm_norm" in hf_name:
         return w.clone()
     if "norm" not in hf_name and "layernorm" not in hf_name:
         return w.clone()

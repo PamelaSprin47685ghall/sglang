@@ -982,16 +982,19 @@ def gguf_quant_weights_iterator(
     _qwen35_f32 = None
     _qwen35_gguf_apply = None
     _qwen35_dequant_apply = None
+    _qwen35_dequant_reader = None
     _qwen35_needs_transform = None
     try:
         from sglang.srt.model_loader.gguf_qwen35moe import (
             apply_f32_transforms as _qwen35_f32,
             apply_gguf_to_hf_weight as _qwen35_gguf_apply,
             qwen35_gguf_dequant_apply_for_load as _qwen35_dequant_apply,
+            qwen35_gguf_dequant_from_reader_tensor as _qwen35_dequant_reader,
             qwen35moe_gguf_on_the_fly_needs_hf_transform as _qwen35_needs_transform,
         )
     except Exception:
         _qwen35_gguf_apply = None
+        _qwen35_dequant_reader = None
 
     gate_exps: Dict[str, torch.Tensor] = {}
     for tensor in reader.tensors:
@@ -1024,11 +1027,11 @@ def gguf_quant_weights_iterator(
             qwen35_linear_attn_vcfg is not None
             and _qwen35_needs_transform is not None
             and _qwen35_dequant_apply is not None
+            and _qwen35_dequant_reader is not None
             and weight_type.name != "F32"
             and _qwen35_needs_transform(name, qwen35_linear_attn_vcfg)
         ):
-            raw = np.asarray(weight, dtype=np.uint8)
-            dense = torch.from_numpy(gguf.dequantize(raw, weight_type)).float()
+            dense = _qwen35_dequant_reader(tensor)
             param = _qwen35_dequant_apply(dense, name, qwen35_linear_attn_vcfg)
             store_dtype = qwen35_dense_storage_dtype or torch.bfloat16
             param = param.to(store_dtype)

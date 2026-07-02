@@ -46,20 +46,26 @@ def test_dequant_apply_matches_dim1_export_on_loader_layout_in_proj_qkv():
     assert got.shape[0] == lead
 
 
-def test_in_proj_z_hidden_major_dequant_transposed_before_v_reorder():
+def _layer0_apply_gguf_ref(gt: str, hf: str, cfg):
+    from gguf import GGUFReader
+
+    from sglang.srt.model_loader.gguf_qwen35moe import (
+        qwen35_gguf_dequant_apply_for_load,
+        qwen35_gguf_dequant_from_reader_tensor,
+    )
+
+    path = "/home/kunweiz/Desktop/Ornith/ornith-gguf-runtime/ornith-gpu-non-expert.gguf"
+    t = next(x for x in GGUFReader(path).tensors if x.name == gt)
+    dense = qwen35_gguf_dequant_from_reader_tensor(t)
+    return qwen35_gguf_dequant_apply_for_load(dense, hf, cfg).float()
+
+
+def test_in_proj_z_gguf_slice_dequant_is_out_in_rows():
     cfg = _vcfg()
-    value_dim = cfg["num_value_heads"] * cfg["head_v_dim"]
-    hidden = 2048
     hf = "model.layers.0.linear_attn.in_proj_z.weight"
-    row_major = qwen35_gguf_dequant_apply_for_load(
-        torch.randn(value_dim, hidden), hf, cfg
-    )
-    col_major = qwen35_gguf_dequant_apply_for_load(
-        torch.randn(hidden, value_dim), hf, cfg
-    )
-    assert row_major.shape == (value_dim, hidden)
-    assert col_major.shape == (value_dim, hidden)
-    assert not torch.allclose(row_major, col_major)
+    ref = _layer0_apply_gguf_ref("blk.0.attn_gate.weight", hf, cfg)
+    value_dim = cfg["num_value_heads"] * cfg["head_v_dim"]
+    assert ref.shape == (value_dim, 2048)
 
 
 def test_on_the_fly_skips_out_proj_runtime_perm_path():
@@ -96,6 +102,40 @@ def test_iterator_yields_bf16_in_proj_qkv_for_layer0_slice():
     ).float()
     ref = qwen35_gguf_dequant_apply_for_load(ref_dense, hf, cfg)
     assert torch.allclose(w.float(), ref.t(), atol=1e-2, rtol=1e-2)
+
+
+def test_iterator_in_proj_z_matches_apply_gguf_hidden_major():
+    path = "/home/kunweiz/Desktop/Ornith/ornith-gguf-runtime/ornith-gpu-non-expert.gguf"
+    gt = "blk.0.attn_gate.weight"
+    hf = "model.layers.0.linear_attn.in_proj_z.weight"
+    cfg = _vcfg()
+    items = dict(
+        gguf_quant_weights_iterator(
+            path, {gt: hf}, qwen35_linear_attn_vcfg=cfg, qwen35_dense_storage_dtype=torch.bfloat16
+        )
+    )
+    w = items[hf.replace("weight", "qweight")].float()
+    ref = _layer0_apply_gguf_ref(gt, hf, cfg)
+    assert ref.shape == (4096, 2048)
+    assert w.shape == ref.shape
+    assert torch.allclose(w, ref, atol=0.05, rtol=0.02)
+
+
+def test_iterator_in_proj_a_matches_apply_gguf_out_in_rows():
+    path = "/home/kunweiz/Desktop/Ornith/ornith-gguf-runtime/ornith-gpu-non-expert.gguf"
+    gt = "blk.0.ssm_alpha.weight"
+    hf = "model.layers.0.linear_attn.in_proj_a.weight"
+    cfg = _vcfg()
+    items = dict(
+        gguf_quant_weights_iterator(
+            path, {gt: hf}, qwen35_linear_attn_vcfg=cfg, qwen35_dense_storage_dtype=torch.bfloat16
+        )
+    )
+    w = items[hf.replace("weight", "qweight")].float()
+    ref = _layer0_apply_gguf_ref(gt, hf, cfg)
+    assert ref.shape == (32, 2048)
+    assert w.shape == ref.shape
+    assert torch.allclose(w, ref, atol=0.05, rtol=0.02)
 
 
 def test_iterator_conv1d_matches_export_v_reorder():

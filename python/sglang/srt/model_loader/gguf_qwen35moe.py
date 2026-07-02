@@ -256,25 +256,33 @@ def qwen35moe_gguf_on_the_fly_needs_hf_transform(hf_name: str, cfg: dict) -> boo
     return any(hf_name.endswith(s) for s in _ON_THE_FLY_DEQUANT_SUFFIXES)
 
 
+def _qwen35_hidden_size(cfg: dict) -> int:
+    return int(cfg.get("hidden_size", 2048))
+
+
 def _qwen35_dequant_to_out_in_rows(w, hf_name: str, cfg: dict):
-    """gguf.dequantize often yields (in_features, out_features); loader rows are (out, in)."""
+    """GGUF dequant may be (out,in) or (hidden,lead); qkv uses lead on dim1 for on-the-fly reorder."""
     import torch
 
     key_dim, value_dim, _ = _linear_attn_dims(cfg)
-    kh = int(cfg["k_heads"])
-    vpk = int(cfg["num_v_per_k"])
     lead = key_dim * 2 + value_dim
-    n_ab = kh * vpk
+    hidden = _qwen35_hidden_size(cfg)
     if w.ndim != 2:
         return w
     if hf_name.endswith(".in_proj_qkv.weight"):
         if w.shape[0] != lead and w.shape[1] == lead:
             return w.t().contiguous()
-    if hf_name.endswith(".in_proj_z.weight"):
-        if w.shape[0] != value_dim and w.shape[1] == value_dim:
-            return w.t().contiguous()
-    if hf_name.endswith((".in_proj_a.weight", ".in_proj_b.weight")):
-        if w.shape[0] != n_ab and w.shape[1] == n_ab:
+        return w
+    if hf_name.endswith(
+        (
+            ".in_proj_z.weight",
+            ".in_proj_a.weight",
+            ".in_proj_b.weight",
+        )
+    ):
+        if w.shape[0] == hidden:
+            return w
+        if w.shape[1] == hidden:
             return w.t().contiguous()
     return w
 
@@ -303,31 +311,53 @@ def _qwen35_on_the_fly_linear_attn_qweight(w, hf_name: str, cfg: dict):
         if w.ndim == 2 and w.shape[1] == lead:
             return _v_reorder_dim1_segment(w, key_dim, value_dim, vpk, kh, hvd)
         return w
-    if hf_name.endswith(".in_proj_z.weight") and w.ndim == 2 and w.shape[0] == value_dim:
-        tail = w.shape[1]
-        return (
-            w.reshape(vpk, kh, hvd, tail)
-            .permute(1, 0, 2, 3)
-            .reshape(value_dim, tail)
-            .contiguous()
+    if hf_name.endswith(
+        (
+            ".in_proj_z.weight",
+            ".in_proj_a.weight",
+            ".in_proj_b.weight",
         )
-    if hf_name.endswith((".in_proj_a.weight", ".in_proj_b.weight")):
-        n = kh * vpk
-        if w.ndim == 2 and w.shape[0] == n:
-            tail = w.shape[1]
-            return (
-                w.reshape(vpk, kh, 1, tail)
-                .permute(1, 0, 2, 3)
-                .reshape(n, tail)
-                .contiguous()
-            )
+    ):
+        return w
     return w
+
+
+def qwen35_gguf_dequant_from_reader_tensor(tensor) -> "torch.Tensor":
+    """Same layout as kt ``gguf_gpu_slice_to_hf_awq_prep._tensor_to_torch`` before HF transforms."""
+    import gguf
+    import numpy as np
+    import torch
+
+    raw = np.asarray(tensor.data, dtype=np.uint8)
+    w = torch.from_numpy(gguf.dequantize(raw, tensor.tensor_type)).float()
+    logical = tuple(int(x) for x in tensor.shape)
+    if w.ndim == 2 and w.shape != logical and w.shape == logical[::-1]:
+        return w.contiguous()
+    if w.numel() == int(np.prod(logical)):
+        return w.reshape(logical).contiguous()
+    return w
+
+
+def qwen35_gguf_dense_for_gguf_linear(w, hf_name: str, cfg: dict):
+    """On-the-fly GGUF linear: ``fused_mul_mat_gguf`` expects qweight rows ``(out_features, in_features)``."""
+    import torch
+
+    dense = w.float() if isinstance(w, torch.Tensor) else torch.from_numpy(w).float()
+    return apply_gguf_to_hf_weight(dense, hf_name, cfg)
 
 
 def qwen35_gguf_dequant_apply_for_load(w, hf_name: str, cfg: dict):
     import torch
 
     dense = w.float() if isinstance(w, torch.Tensor) else torch.from_numpy(w).float()
+    if hf_name.endswith(
+        (
+            ".in_proj_z.weight",
+            ".in_proj_a.weight",
+            ".in_proj_b.weight",
+        )
+    ):
+        return qwen35_gguf_dense_for_gguf_linear(dense, hf_name, cfg)
     return _qwen35_on_the_fly_linear_attn_qweight(dense, hf_name, cfg)
 
 

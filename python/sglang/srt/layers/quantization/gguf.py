@@ -290,16 +290,27 @@ def apply_gguf_embedding(
     hidden_size: int,
     dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
+    # GGUF ``token_embd`` / ``output`` matrices are stored as [hidden, vocab];
+    # ``torch.embedding`` expects [vocab, hidden].
+    vocab_axis = 1 if qweight.shape[0] == hidden_size else 0
     if qweight_type in UNQUANTIZED_TYPES:
-        return torch.embedding(qweight, x)
+        table = qweight if vocab_axis == 0 else qweight.t()
+        return torch.embedding(table, x)
     elif qweight_type in DEQUANT_TYPES:
         block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
         x_flat = x.flatten()
-        assert hidden_size == qweight.shape[1] // type_size * block_size
-        quant = torch.index_select(qweight, dim=0, index=x_flat)
-        dequant = ggml_dequantize(
-            quant, qweight_type, hidden_size, x_flat.shape[0], dtype
-        )
+        if vocab_axis == 1:
+            assert hidden_size == qweight.shape[0] // type_size * block_size
+            quant = torch.index_select(qweight, dim=1, index=x_flat)
+            dequant = ggml_dequantize(
+                quant, qweight_type, hidden_size, x_flat.shape[0], dtype
+            )
+        else:
+            assert hidden_size == qweight.shape[1] // type_size * block_size
+            quant = torch.index_select(qweight, dim=0, index=x_flat)
+            dequant = ggml_dequantize(
+                quant, qweight_type, hidden_size, x_flat.shape[0], dtype
+            )
         return dequant.view(*x.shape, hidden_size)
     else:
         qweight_type = WeightType(qweight_type)

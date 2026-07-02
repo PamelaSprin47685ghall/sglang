@@ -227,6 +227,7 @@ class VocabParallelEmbedding(torch.nn.Module):
             assert use_attn_tp_group is False
             tp_rank = 0
             self.tp_size = 1
+        self.tp_rank = tp_rank
 
         self.num_embeddings = num_embeddings
         self.org_vocab_size = org_num_embeddings or num_embeddings
@@ -421,12 +422,25 @@ class VocabParallelEmbedding(torch.nn.Module):
         output_dim = getattr(param, "output_dim", None)
         packed_dim = getattr(param, "packed_dim", None)
 
-        # If the parameter is a gguf weight, then load it directly.
-        if getattr(param, "is_gguf_weight_type", None):
-            param.data.copy_(loaded_weight)
-            param.weight_type = loaded_weight.item()
+        if getattr(param, "is_gguf_weight_type", False):
+            if loaded_weight.dim() == 0 or loaded_weight.numel() == 1:
+                param.data.copy_(loaded_weight.reshape_as(param.data))
+                param.weight_type = int(loaded_weight.item())
+            else:
+                param.data.copy_(loaded_weight)
             return
-        elif isinstance(param, UninitializedParameter):
+
+        if getattr(param, "is_gguf_weight", False):
+            if output_dim is not None:
+                shard_size = loaded_weight.size(output_dim) // self.tp_size
+                start_idx = self.tp_rank * shard_size
+                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+            if isinstance(param, UninitializedParameter):
+                param.materialize(loaded_weight.shape, dtype=loaded_weight.dtype)
+            param.data.copy_(loaded_weight)
+            return
+
+        if isinstance(param, UninitializedParameter):
             shape = list(loaded_weight.shape)
             if output_dim is not None:
                 shape[output_dim] = shape[output_dim] // self.tp_size

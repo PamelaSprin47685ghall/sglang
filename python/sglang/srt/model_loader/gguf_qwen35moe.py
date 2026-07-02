@@ -61,6 +61,27 @@ _FUSED_EXPERT_TARGETS = {
 }
 
 
+def _map_shared_expert_gguf_checkpoint_name(name: str) -> str:
+    """Map shared_expert GGUF checkpoint names to SGLang model parameter names.
+
+    GGUF stores shared_expert ``gate_proj`` and ``up_proj`` as separate tensors,
+    but the model's ``Qwen2MoeMLP`` (``shared_expert``) exposes a single fused
+    ``gate_up_proj`` (``MergedColumnParallelLinear``).  Similarly, the GGUF
+    name for the shared-expert routing gate is ``shared_expert.gate.weight``,
+    but the model parameter is ``shared_expert_gate.weight`` (one level, not
+    nested under ``shared_expert.*``).
+
+    Call this *before* the ``stacked_params_mapping`` loop in ``load_weights``
+    so the fused name no longer contains ``gate_proj`` or ``up_proj``, causing
+    ``stacked_params_mapping`` to skip it naturally (the guard
+    ``"shared_expert" in name`` remains as a safety net).
+    """
+    # Only rename routing gate; gate_proj/up_proj are loaded via shard_id
+    # into ``gate_up_proj`` in ``load_weights`` (both map to same target).
+    name = name.replace(".shared_expert.gate.", ".shared_expert_gate.")
+    return name
+
+
 def is_qwen35moe_expert(gguf_name: str) -> bool:
     match = _BLOCK_RE.match(gguf_name)
     if not match:

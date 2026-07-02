@@ -6,12 +6,12 @@ from sglang.srt.models.qwen3_5 import (
 )
 
 
-def test_gguf_flat_layer_maps_to_language_model():
+def test_gguf_flat_layer_maps_directly():
     n = "model.layers.3.linear_attn.out_proj.qweight"
     assert _is_gguf_flat_text_checkpoint_name(n)
     assert (
         _checkpoint_name_to_model_param(n)
-        == "model.language_model.layers.3.linear_attn.out_proj.qweight"
+        == "model.layers.3.linear_attn.out_proj.qweight"
     )
 
 

@@ -96,7 +96,10 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.gguf_qwen35moe import get_out_proj_activation_perm
+from sglang.srt.model_loader.gguf_qwen35moe import (
+    _map_shared_expert_gguf_checkpoint_name,
+    get_out_proj_activation_perm,
+)
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -139,6 +142,20 @@ def _checkpoint_name_to_model_param(name: str) -> str:
     return name
 
 
+def _linear_param_device(linear: nn.Module) -> torch.device:
+    """Resolve device from a linear layer supporting regular or quantized weights.
+
+    GGUF ``GGUFLinearMethod.create_weights`` registers ``qweight`` as the primary
+    parameter instead of ``weight``, so ``linear.weight`` may not exist after
+    ``load_weights``.  This helper checks for ``qweight`` first, then falls back
+    to ``weight``.
+    """
+    qweight = getattr(linear, "qweight", None)
+    if qweight is not None:
+        return qweight.device
+    return linear.weight.device
+
+
 def _enable_gguf_linear_attn_out_proj_perms(root: nn.Module) -> None:
     layer_lists = []
     if hasattr(root, "layers"):
@@ -162,19 +179,19 @@ def _enable_gguf_linear_attn_out_proj_perms(root: nn.Module) -> None:
 
 
 def _map_gguf_text_name_to_vl_param(name: str) -> str:
-    """GGUF custom map uses flat ``model.layers.*``; VL ``named_parameters`` use ``model.language_model.*``."""
-    if "language_model" in name or name.startswith("visual.") or name.startswith("model.visual."):
+    """GGUF flat ``model.layers.*`` / ``model.embed_tokens.*`` match VL LM keys.
+
+    ``Qwen3_5MoeForConditionalGeneration`` exposes the text stack as ``self.model``
+    with layer prefix ``model.layers`` (not ``model.language_model.layers`` in
+    ``named_parameters``).  Only ``model.lm_head.*`` lifts to top-level ``lm_head``."""
+    if "language_model" in name or name.startswith("visual.") or name.startswith(
+        "model.visual."
+    ):
         return name
     if name.startswith("model.lm_head."):
         return name.replace("model.lm_head.", "lm_head.", 1)
     if name == "model.lm_head.weight" or name.startswith("model.lm_head"):
         return name.replace("model.lm_head", "lm_head", 1)
-    if name.startswith("model.embed_tokens"):
-        return name.replace("model.embed_tokens", "model.language_model.embed_tokens", 1)
-    if name.startswith("model.norm"):
-        return name.replace("model.norm", "model.language_model.norm", 1)
-    if name.startswith("model.layers."):
-        return name.replace("model.layers.", "model.language_model.layers.", 1)
     return name
 
 
@@ -184,6 +201,81 @@ def _normalize_qwen35_checkpoint_name(name: str) -> str:
     if ".self_attn." in name:
         name = name.replace(".self_attn", "")
     return name
+
+
+def _try_load_gguf_vocab_qweight(
+    name: str,
+    loaded_weight: torch.Tensor,
+    model: nn.Module,
+    loaded_params: Set[str],
+    params_dict: Optional[dict] = None,
+) -> bool:
+    """Load embed/lm_head when checkpoint name misses ``params_dict`` keys."""
+    embed_stems = ("model.embed_tokens.", "model.language_model.embed_tokens.")
+    if not (name.startswith(embed_stems) or name.startswith("lm_head.")):
+        return False
+    suffix = name.rsplit(".", 1)[-1]
+    if suffix not in ("qweight", "qweight_type", "weight"):
+        return False
+    if params_dict is not None and name in params_dict:
+        return False
+    if name.startswith(embed_stems[0]) or name.startswith(embed_stems[1]):
+        mod = getattr(model, "model", model)
+        leaf = getattr(mod, "embed_tokens", None)
+    else:
+        leaf = getattr(model, "lm_head", None)
+    if leaf is None:
+        return False
+    param = getattr(leaf, suffix, None)
+    if param is None:
+        return False
+    loader = getattr(leaf, "weight_loader", default_weight_loader)
+    loader(param, loaded_weight)
+    loaded_params.add(name)
+    return True
+
+
+def _try_load_shared_expert_gguf_shard(
+    name: str,
+    loaded_weight: torch.Tensor,
+    params_dict: dict,
+    loaded_params: Set[str],
+) -> bool:
+    """Load GGUF shared_expert gate/up/down into ``Qwen2MoeMLP`` fused names."""
+    if ".mlp.shared_expert_gate." in name:
+        if name not in params_dict:
+            return False
+        param = params_dict[name]
+        w = loaded_weight
+        if w.dim() == 1 and param.data.dim() == 2 and param.data.shape[0] == 1:
+            w = w.unsqueeze(0)
+        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+        weight_loader(param, w)
+        loaded_params.add(name)
+        return True
+    if ".mlp.shared_expert." not in name:
+        return False
+    if ".mlp.shared_expert.gate_proj." in name:
+        target = name.replace(".gate_proj.", ".gate_up_proj.", 1)
+        shard_id = 0
+    elif ".mlp.shared_expert.up_proj." in name:
+        target = name.replace(".up_proj.", ".gate_up_proj.", 1)
+        shard_id = 1
+    elif ".mlp.shared_expert.down_proj." in name:
+        target = name
+        shard_id = None
+    else:
+        return False
+    if target not in params_dict:
+        return False
+    param = params_dict[target]
+    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+    if shard_id is None:
+        weight_loader(param, loaded_weight)
+    else:
+        weight_loader(param, loaded_weight, shard_id)
+    loaded_params.add(target)
+    return True
 
 
 def _qwen35_moe_num_experts(config) -> int:
@@ -505,7 +597,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             v_per_k, self.num_k_heads, self.head_v_dim
         )
         self._gguf_out_proj_act_perm = perm.to(
-            device=self.out_proj.weight.device, dtype=torch.long
+            device=_linear_param_device(self.out_proj), dtype=torch.long
         )
 
     def _out_proj_linear_input(self, core_attn_out: torch.Tensor) -> torch.Tensor:
@@ -1140,6 +1232,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
                 org_num_embeddings=config.vocab_size,
+                quant_config=quant_config,
                 enable_tp=not is_dp_attention_enabled(),
             )
 
@@ -1473,9 +1566,18 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                     "Skipping qwen3.5 MTP/nextn weights during main model load."
                 )
                 continue
-            if "visual" in name:
-                continue
             name = _normalize_qwen35_checkpoint_name(name)
+            if _try_load_gguf_vocab_qweight(
+                name, loaded_weight, self, loaded_params, params_dict
+            ):
+                continue
+            # GGUF shared_expert gate_proj/up_proj must fuse into
+            # gate_up_proj; shared_expert.gate -> shared_expert_gate.
+            name = _map_shared_expert_gguf_checkpoint_name(name)
+            if _try_load_shared_expert_gguf_shard(
+                name, loaded_weight, params_dict, loaded_params
+            ):
+                continue
 
             if (
                 name.endswith(".mlp.experts.w13_qweight")
@@ -1534,7 +1636,11 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 # name will be updated to mlp.experts[0].gate_up_proj, which
                 # will then be updated below in expert_params_mapping
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if "mlp.experts" in name:
+                # Similarly, shared_expert.gate_proj must NOT be rewritten
+                # to gate_up_proj — shared_expert is a single Module
+                # with separate gate_proj/down_proj/up_proj attributes,
+                # not a fused gate_up_proj.
+                if "mlp.experts" in name or "shared_expert" in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra parameters for GPTQ/modelopt models.
@@ -1858,7 +1964,17 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             name = _checkpoint_name_to_model_param(name)
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
-
+            if _try_load_gguf_vocab_qweight(
+                name, loaded_weight, self, loaded_params, params_dict
+            ):
+                continue
+            # GGUF shared_expert gate_proj/up_proj must fuse into
+            # gate_up_proj; shared_expert.gate -> shared_expert_gate.
+            name = _map_shared_expert_gguf_checkpoint_name(name)
+            if _try_load_shared_expert_gguf_shard(
+                name, loaded_weight, params_dict, loaded_params
+            ):
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if name.endswith("experts.gate_up_proj") or name.endswith(
@@ -1879,7 +1995,11 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 # name will be updated to mlp.experts[0].gate_up_proj, which
                 # will then be updated below in expert_params_mapping
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if "mlp.experts" in name:
+                # Similarly, shared_expert.gate_proj must NOT be rewritten
+                # to gate_up_proj — shared_expert is a single Module
+                # with separate gate_proj/down_proj/up_proj attributes,
+                # not a fused gate_up_proj.
+                if "mlp.experts" in name or "shared_expert" in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra parameters for GPTQ/modelopt models.
@@ -2072,7 +2192,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
-            loaded_params.add(name)
+                loaded_params.add(name)
 
         if saw_gguf_checkpoint:
             _enable_gguf_linear_attn_out_proj_perms(self)

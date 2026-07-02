@@ -1,22 +1,29 @@
-"""GGUF flat names must map onto Qwen3.5 MoE VL parameter namespace."""
+"""GGUF flat names align with Qwen3.5 MoE VL ``named_parameters`` as ``model.*``."""
 from sglang.srt.models.qwen3_5 import (
     _map_gguf_text_name_to_vl_param,
     _normalize_qwen35_checkpoint_name,
 )
 
 
-def test_flat_embed_maps_to_language_model():
+def test_flat_embed_maps_directly():
     assert (
         _map_gguf_text_name_to_vl_param("model.embed_tokens.qweight")
-        == "model.language_model.embed_tokens.qweight"
+        == "model.embed_tokens.qweight"
     )
 
 
-def test_flat_layer_maps_to_language_model():
+def test_flat_layer_maps_directly():
     name = _map_gguf_text_name_to_vl_param(
         "model.layers.3.mlp.experts.w13_qweight"
     )
-    assert name == "model.language_model.layers.3.mlp.experts.w13_qweight"
+    assert name == "model.layers.3.mlp.experts.w13_qweight"
+
+
+def test_flat_norm_maps_directly():
+    assert (
+        _map_gguf_text_name_to_vl_param("model.norm.qweight")
+        == "model.norm.qweight"
+    )
 
 
 def test_lm_head_maps_to_top_level():

@@ -1255,6 +1255,8 @@ class Qwen3_5ForCausalLM(nn.Module):
 
 
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
+    _supports_attention_backend = True
+
     def __init__(
         self,
         config: Qwen3_5TextConfig,
@@ -1797,4 +1799,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
 
 
-EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
+EntryClass = [
+    Qwen3_5MoeForCausalLM,
+    Qwen3_5MoeForConditionalGeneration,
+    Qwen3_5ForConditionalGeneration,
+]

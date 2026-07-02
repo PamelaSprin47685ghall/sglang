@@ -38,3 +38,10 @@ __all__ = [
     "get_architecture_class_name",
     "get_model_architecture",
 ]
+
+try:
+    from sglang.srt.model_loader.gguf_qwen35moe_hook import install_gguf_qwen35moe
+
+    install_gguf_qwen35moe()
+except Exception:
+    pass

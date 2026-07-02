@@ -1961,6 +1961,54 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         return model.eval()
 
 
+def _is_gguf_model_path(model_path: object) -> bool:
+    if not isinstance(model_path, str) or not os.path.isfile(model_path):
+        return False
+    if model_path.lower().endswith(".gguf"):
+        return True
+    try:
+        with open(model_path, "rb") as model_file:
+            return model_file.read(4) == b"GGUF"
+    except OSError:
+        return False
+
+
+def _get_gguf_num_hidden_layers(config: object) -> int:
+    num_layers = getattr(config, "num_hidden_layers", None)
+    if num_layers is not None:
+        return num_layers
+    text_config = getattr(config, "text_config", None)
+    num_layers = getattr(text_config, "num_hidden_layers", None)
+    if num_layers is not None:
+        return num_layers
+    raise AttributeError(f"{type(config).__name__} has no num_hidden_layers")
+
+
+def _patch_gguf_text_config(config: object, model_path: str) -> None:
+    text_config = getattr(config, "text_config", None)
+    if text_config is None:
+        return
+    config_path = os.path.join(os.path.dirname(model_path), "config.json")
+    if not os.path.isfile(config_path):
+        return
+    try:
+        with open(config_path, encoding="utf-8") as config_file:
+            raw_text_config = json.load(config_file).get("text_config", {})
+    except (OSError, json.JSONDecodeError):
+        return
+    for key, value in raw_text_config.items():
+        if not hasattr(text_config, key) and value is not None:
+            setattr(text_config, key, value)
+
+
+def _get_gguf_dummy_config(config: object, model_path: str) -> object:
+    _patch_gguf_text_config(config, model_path)
+    text_config = getattr(config, "text_config", None)
+    if text_config is not None and getattr(text_config, "vocab_size", None) is not None:
+        return text_config
+    return config
+
+
 class GGUFModelLoader(BaseModelLoader):
     """
     Model loader that can load GGUF files. This is useful for loading models
@@ -2003,7 +2051,11 @@ class GGUFModelLoader(BaseModelLoader):
             ) from err
 
         config = model_config.hf_config
-        model_type = config.model_type
+        model_type = {
+            "qwen3_5": "qwen35",
+            "qwen3_5_moe": "qwen35moe",
+            "qwen3_5_moe_text": "qwen35moe",
+        }.get(config.model_type, config.model_type)
         # hack: ggufs have a different name than transformers
         if model_type == "cohere":
             model_type = "command-r"
@@ -2014,10 +2066,12 @@ class GGUFModelLoader(BaseModelLoader):
                 break
         if arch is None:
             raise RuntimeError(f"Unknown gguf model_type: {model_type}")
-        num_layers = config.num_hidden_layers
+        num_layers = _get_gguf_num_hidden_layers(config)
         name_map = gguf.get_tensor_name_map(arch, num_layers)
         with torch.device("meta"):
-            dummy_model = AutoModelForCausalLM.from_config(config)
+            dummy_model = AutoModelForCausalLM.from_config(
+                _get_gguf_dummy_config(config, model_config.model_path)
+            )
         state_dict = dummy_model.state_dict()
 
         gguf_to_hf_name_map = {}
@@ -2722,6 +2776,15 @@ def get_model_loader(
 
     if load_config.load_format == LoadFormat.DUMMY:
         return DummyModelLoader(load_config)
+
+    if (
+        load_config.load_format == LoadFormat.AUTO
+        and model_config is not None
+        and _is_gguf_model_path(model_config.model_path)
+    ):
+        logger.info("Detected GGUF model file; using GGUFModelLoader.")
+        load_config.load_format = LoadFormat.GGUF
+        return GGUFModelLoader(load_config)
 
     if model_config and (
         (hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant)

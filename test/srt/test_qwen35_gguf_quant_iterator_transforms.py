@@ -118,6 +118,37 @@ def test_iterator_conv1d_matches_export_v_reorder():
     assert torch.allclose(w.float(), ref.float(), atol=1e-5)
 
 
+def _shexp_q6k_fused_vs_dequant(gt: str, in_dim: int, out_dim: int, atol: float = 0.02):
+    import numpy as np
+    from gguf import GGUFReader
+
+    from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
+
+    if not torch.cuda.is_available():
+        return
+    path = "/home/kunweiz/Desktop/Ornith/ornith-gguf-runtime/ornith-gpu-non-expert.gguf"
+    t = next(x for x in GGUFReader(path).tensors if x.name == gt)
+    raw = torch.tensor(np.array(t.data)).cuda()
+    dense = (
+        torch.from_numpy(np.array(gguf.dequantize(np.array(t.data), t.tensor_type)))
+        .float()
+        .cuda()
+    )
+    assert dense.shape == (out_dim, in_dim)
+    x = torch.randn(2, in_dim, dtype=torch.float16, device="cuda")
+    y = fused_mul_mat_gguf(x, raw, int(t.tensor_type))
+    y_ref = x.float() @ dense.T
+    assert torch.allclose(y.float(), y_ref, atol=atol, rtol=0.01)
+
+
+def test_shared_expert_gate_q6k_fused_matches_dequant():
+    _shexp_q6k_fused_vs_dequant("blk.0.ffn_gate_shexp.weight", 2048, 512)
+
+
+def test_shared_expert_up_q6k_fused_matches_dequant():
+    _shexp_q6k_fused_vs_dequant("blk.0.ffn_up_shexp.weight", 2048, 512)
+
+
 def test_shared_expert_down_q6k_fused_matches_dequant_row_layout():
     import numpy as np
     from gguf import GGUFReader
@@ -207,6 +238,51 @@ def test_out_proj_q6k_fused_matches_dense_with_activation_perm():
     y_fused = fused_mul_mat_gguf(x_perm, raw, qt)
     y_dense = x_perm.float() @ dense.T
     assert torch.allclose(y_fused.float(), y_dense, atol=0.15, rtol=0.02)
+
+
+def test_layer3_o_proj_q6k_fused_matches_dequant():
+    import numpy as np
+    from gguf import GGUFReader
+
+    from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
+
+    if not torch.cuda.is_available():
+        return
+    path = "/home/kunweiz/Desktop/Ornith/ornith-gguf-runtime/ornith-gpu-non-expert.gguf"
+    gt = "blk.3.attn_output.weight"
+    t = next(x for x in GGUFReader(path).tensors if x.name == gt)
+    raw = torch.tensor(np.array(t.data)).cuda()
+    qt = int(t.tensor_type)
+    dense = (
+        torch.from_numpy(np.array(gguf.dequantize(np.array(t.data), t.tensor_type)))
+        .float()
+        .cuda()
+    )
+    assert dense.shape == (2048, 4096)
+    x = torch.randn(2, 4096, dtype=torch.float16, device="cuda")
+    y = fused_mul_mat_gguf(x, raw, qt)
+    y_ref = x.float() @ dense.T
+    assert torch.allclose(y.float(), y_ref, atol=0.06, rtol=0.01)
+
+
+def test_layer3_qk_norm_f32_iterator_applies_minus_one():
+    from gguf import GGUFReader
+
+    from sglang.srt.model_loader.gguf_qwen35moe import (
+        apply_f32_transforms_hf,
+        qwen35moe_gguf_to_hf,
+    )
+
+    path = "/home/kunweiz/Desktop/Ornith/ornith-gguf-runtime/ornith-gpu-non-expert.gguf"
+    for gt in ("blk.3.attn_q_norm.weight", "blk.3.attn_k_norm.weight"):
+        t = next(x for x in GGUFReader(path).tensors if x.name == gt)
+        raw = torch.from_numpy(np.array(t.data, copy=True)).float()
+        hf = qwen35moe_gguf_to_hf(gt).replace("model.language_model.", "model.")
+        ref = apply_f32_transforms_hf(raw, hf)
+        items = dict(
+            gguf_quant_weights_iterator(path, {gt: hf}, qwen35_linear_attn_vcfg=_vcfg())
+        )
+        assert torch.allclose(items[hf].float(), ref.float(), atol=1e-6)
 
 
 def test_in_proj_qkv_dim1_slices_transpose_for_linear_weight_layout():

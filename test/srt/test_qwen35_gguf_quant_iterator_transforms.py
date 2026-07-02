@@ -118,6 +118,22 @@ def test_iterator_conv1d_matches_export_v_reorder():
     assert torch.allclose(w.float(), ref.float(), atol=1e-5)
 
 
+def test_mlp_gate_f32_loader_layout_matches_linear():
+    from sglang.srt.model_loader.gguf_qwen35moe import qwen35moe_gguf_to_hf
+
+    path = "/home/kunweiz/Desktop/Ornith/ornith-gguf-runtime/ornith-gpu-non-expert.gguf"
+    gt = "blk.0.ffn_gate_inp.weight"
+    hf = qwen35moe_gguf_to_hf(gt).replace("model.language_model.", "model.")
+    cfg = _vcfg()
+    items = dict(
+        gguf_quant_weights_iterator(path, {gt: hf}, qwen35_linear_attn_vcfg=cfg)
+    )
+    w = items[hf]
+    assert w.shape == (256, 2048)
+    x = torch.randn(2, 2048)
+    torch.mm(x, w.T)
+
+
 def test_layer3_attn_q_q6k_fused_matches_dequant():
     import numpy as np
     from gguf import GGUFReader

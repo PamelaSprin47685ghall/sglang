@@ -89,10 +89,10 @@ def test_iterator_yields_bf16_in_proj_qkv_for_layer0_slice():
     assert qname in items
     w = items[qname]
     assert w.dtype == torch.bfloat16
-    assert w.shape[0] == 8192
+    assert w.shape == (2048, 8192)
     t = next(x for x in reader.tensors if x.name == gt)
     ref_dense = torch.from_numpy(
         np.array(gguf.dequantize(np.array(t.data), t.tensor_type))
     ).float()
     ref = qwen35_gguf_dequant_apply_for_load(ref_dense, hf, cfg)
-    assert torch.allclose(w.float(), ref, atol=1e-2, rtol=1e-2)
+    assert torch.allclose(w.float(), ref.t(), atol=1e-2, rtol=1e-2)

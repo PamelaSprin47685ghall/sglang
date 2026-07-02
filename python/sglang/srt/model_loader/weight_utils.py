@@ -1042,6 +1042,8 @@ def gguf_quant_weights_iterator(
                     yield type_name, type_tensor
             else:
                 yield qname.replace("qweight", "qweight_type"), type_tensor
+            if name.endswith("linear_attn.in_proj_qkv.weight") and param.ndim == 2:
+                param = param.t().contiguous()
             yield qname, param
             continue
 

@@ -2117,11 +2117,10 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                             cfg.linear_value_head_dim
                             * cfg.linear_num_value_heads
                         )
-                        if (
-                            loaded_weight.dim() == 2
-                            and loaded_weight.size(0)
-                            == key_dim + key_dim + value_dim
-                        ):
+                        lead = key_dim + key_dim + value_dim
+                        if loaded_weight.dim() != 2:
+                            pass
+                        elif loaded_weight.size(0) == lead:
                             for shard_id, sl in zip(
                                 (0, 1, 2),
                                 (
@@ -2133,6 +2132,22 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                 w_loader(
                                     param,
                                     loaded_weight[sl[0] : sl[1]].contiguous(),
+                                    shard_id,
+                                )
+                            loaded_params.add(name)
+                            continue
+                        elif loaded_weight.size(1) == lead:
+                            for shard_id, sl in zip(
+                                (0, 1, 2),
+                                (
+                                    (0, key_dim),
+                                    (key_dim, key_dim * 2),
+                                    (key_dim * 2, key_dim * 2 + value_dim),
+                                ),
+                            ):
+                                w_loader(
+                                    param,
+                                    loaded_weight[:, sl[0] : sl[1]].contiguous(),
                                     shard_id,
                                 )
                             loaded_params.add(name)

@@ -303,3 +303,30 @@ def test_in_proj_qkv_dim1_slices_transpose_for_linear_weight_layout():
         assert w.shape[0] == sl[1] - sl[0]
         assert w.shape[1] == hidden
         torch.mm(torch.randn(4, hidden), w.t())
+
+
+def test_token_embd_q6k_fused_embedding_matches_dequant_for_france_prompt_ids():
+    import numpy as np
+    from gguf import GGUFReader
+
+    from sglang.srt.layers.quantization.gguf import apply_gguf_embedding
+
+    if not torch.cuda.is_available():
+        return
+    path = "/home/kunweiz/Desktop/Ornith/ornith-gguf-runtime/ornith-gpu-non-expert.gguf"
+    gt = "token_embd.weight"
+    t = next(x for x in GGUFReader(path).tensors if x.name == gt)
+    raw_qweight = torch.tensor(np.array(t.data, copy=True)).cuda()
+    qt = int(t.tensor_type)
+    hidden_size = 2048
+    dense = (
+        torch.from_numpy(np.array(gguf.dequantize(np.array(t.data, copy=True), t.tensor_type)))
+        .float()
+        .cuda()
+    )
+    assert dense.shape == (248320, hidden_size)
+    ids = torch.tensor([760, 6511, 314, 9338, 369], dtype=torch.long, device="cuda")
+    emb = apply_gguf_embedding(ids, raw_qweight, qt, hidden_size, dtype=torch.float32)
+    ref = dense[ids]
+    assert emb.shape == (5, hidden_size)
+    assert torch.allclose(emb.float(), ref.float(), atol=0.02)

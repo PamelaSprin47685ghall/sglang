@@ -98,6 +98,26 @@ def test_iterator_yields_bf16_in_proj_qkv_for_layer0_slice():
     assert torch.allclose(w.float(), ref.t(), atol=1e-2, rtol=1e-2)
 
 
+def test_iterator_conv1d_matches_export_v_reorder():
+    from gguf import GGUFReader
+
+    from sglang.srt.model_loader.gguf_qwen35moe import apply_gguf_to_hf_weight
+
+    path = "/home/kunweiz/Desktop/Ornith/ornith-gguf-runtime/ornith-gpu-non-expert.gguf"
+    gt = "blk.0.ssm_conv1d.weight"
+    hf = "model.layers.0.linear_attn.conv1d.weight"
+    cfg = _vcfg()
+    items = dict(
+        gguf_quant_weights_iterator(path, {gt: hf}, qwen35_linear_attn_vcfg=cfg)
+    )
+    w = items[hf]
+    assert w.ndim == 3 and w.shape[1] == 1
+    t = next(x for x in GGUFReader(path).tensors if x.name == gt)
+    raw = torch.from_numpy(np.array(t.data, copy=True)).float()
+    ref = apply_gguf_to_hf_weight(raw, hf, cfg)
+    assert torch.allclose(w.float(), ref.float(), atol=1e-5)
+
+
 def test_in_proj_qkv_dim1_slices_transpose_for_linear_weight_layout():
     cfg = _vcfg()
     hidden = 2048

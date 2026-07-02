@@ -980,16 +980,18 @@ def gguf_quant_weights_iterator(
     tensor_names = {t.name for t in reader.tensors}
 
     _qwen35_f32 = None
+    _qwen35_gguf_apply = None
     _qwen35_dequant_apply = None
     _qwen35_needs_transform = None
     try:
         from sglang.srt.model_loader.gguf_qwen35moe import (
             apply_f32_transforms as _qwen35_f32,
+            apply_gguf_to_hf_weight as _qwen35_gguf_apply,
             qwen35_gguf_dequant_apply_for_load as _qwen35_dequant_apply,
             qwen35moe_gguf_on_the_fly_needs_hf_transform as _qwen35_needs_transform,
         )
     except Exception:
-        pass
+        _qwen35_gguf_apply = None
 
     gate_exps: Dict[str, torch.Tensor] = {}
     for tensor in reader.tensors:
@@ -1084,15 +1086,22 @@ def gguf_quant_weights_iterator(
         param = torch.tensor(weight)
 
         if _qwen35_f32 is not None and weight_type.name == "F32":
-            param = _qwen35_f32(param, gt)
-
-        if (
-            _qwen35_f32 is not None
-            and weight_type.name == "F32"
-            and gt.endswith("ssm_conv1d.weight")
-            and param.ndim == 2
-        ):
-            param = param.unsqueeze(1)
+            if (
+                qwen35_linear_attn_vcfg is not None
+                and _qwen35_gguf_apply is not None
+                and (
+                    gt.endswith("ssm_conv1d.weight")
+                    or gt.endswith("ssm_a")
+                    or gt.endswith("ssm_dt.bias")
+                )
+            ):
+                param = _qwen35_gguf_apply(
+                    param.float(), name, qwen35_linear_attn_vcfg
+                )
+            else:
+                param = _qwen35_f32(param, gt)
+                if gt.endswith("ssm_conv1d.weight") and param.ndim == 2:
+                    param = param.unsqueeze(1)
 
         if is_up:
             gate_key = gt.replace("ffn_up_exps.weight", "ffn_gate_exps.weight")

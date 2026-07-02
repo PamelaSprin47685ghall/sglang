@@ -10,22 +10,22 @@ from sglang.srt.model_loader.gguf_qwen35moe import (
 KNOWN_MAP = [
     ("token_embd.weight", "model.embed_tokens.weight"),
     ("output_norm.weight", "model.norm.weight"),
-    ("output.weight", "model.lm_head.weight"),
-    ("blk.0.attn_norm.weight", "model.layers.0.attn_norm.weight"),
-    ("blk.0.ffn_norm.weight", "model.layers.0.ffn_norm.weight"),
-    ("blk.0.attn_q.weight", "model.layers.0.attn.q_proj.weight"),
-    ("blk.0.attn_k.weight", "model.layers.0.attn.k_proj.weight"),
-    ("blk.0.attn_v.weight", "model.layers.0.attn.v_proj.weight"),
-    ("blk.0.attn_output.weight", "model.layers.0.attn.output.weight"),
-    ("blk.0.attn_q_norm.weight", "model.layers.0.attn.q_norm.weight"),
-    ("blk.0.attn_k_norm.weight", "model.layers.0.attn.k_norm.weight"),
+    ("output.weight", "lm_head.weight"),
+    ("blk.0.attn_norm.weight", "model.layers.0.input_layernorm.weight"),
+    ("blk.0.ffn_norm.weight", "model.layers.0.self_attn.ffn_norm.weight"),
+    ("blk.0.attn_q.weight", "model.layers.0.self_attn.q_proj.weight"),
+    ("blk.0.attn_k.weight", "model.layers.0.self_attn.k_proj.weight"),
+    ("blk.0.attn_v.weight", "model.layers.0.self_attn.v_proj.weight"),
+    ("blk.0.attn_output.weight", "model.layers.0.self_attn.o_proj.weight"),
+    ("blk.0.attn_q_norm.weight", "model.layers.0.q_norm.weight"),
+    ("blk.0.attn_k_norm.weight", "model.layers.0.k_norm.weight"),
     ("blk.0.attn_qkv.weight", "model.layers.0.linear_attn.in_proj_qkv.weight"),
     ("blk.0.attn_gate.weight", "model.layers.0.linear_attn.in_proj_z.weight"),
     ("blk.0.ssm_alpha.weight", "model.layers.0.linear_attn.in_proj_a.weight"),
     ("blk.0.ssm_beta.weight", "model.layers.0.linear_attn.in_proj_b.weight"),
-    ("blk.0.ssm_a", "model.layers.0.linear_attn.ssm_a.weight"),
-    ("blk.0.ssm_a.weight", "model.layers.0.linear_attn.ssm_a.weight"),
-    ("blk.0.ssm_dt.bias", "model.layers.0.linear_attn.ssm_dt.bias"),
+    ("blk.0.ssm_a", "model.layers.0.linear_attn.A_log"),
+    ("blk.0.ssm_a.weight", "model.layers.0.linear_attn.A_log"),
+    ("blk.0.ssm_dt.bias", "model.layers.0.linear_attn.dt_bias"),
     ("blk.0.ssm_conv1d.weight", "model.layers.0.linear_attn.conv1d.weight"),
     ("blk.0.ssm_norm.weight", "model.layers.0.linear_attn.norm.weight"),
     ("blk.0.linear_attn_norm.weight", "model.layers.0.linear_attn.norm.weight"),
@@ -34,17 +34,17 @@ KNOWN_MAP = [
     ("blk.0.ffn_gate_exps.weight", "model.layers.0.mlp.experts.gate_proj.weight"),
     ("blk.0.ffn_up_exps.weight", "model.layers.0.mlp.experts.up_proj.weight"),
     ("blk.0.ffn_down_exps.weight", "model.layers.0.mlp.experts.down_proj.weight"),
-    ("blk.40.nextn.eh_proj.weight", "model.mtp.eh_proj.weight"),
-    ("blk.40.nextn.enorm.weight", "model.mtp.enorm.weight"),
-    ("blk.40.nextn.hnorm.weight", "model.mtp.hnorm.weight"),
-    ("blk.40.nextn.shared_head_norm.weight", "model.mtp.shared_head_norm.weight"),
+    ("blk.40.nextn.eh_proj.weight", "model.mtp.fc.weight"),
+    ("blk.40.nextn.enorm.weight", "model.mtp.pre_fc_norm_embedding.weight"),
+    ("blk.40.nextn.hnorm.weight", "model.mtp.pre_fc_norm_hidden.weight"),
+    ("blk.40.nextn.shared_head_norm.weight", "model.mtp.norm.weight"),
     ("blk.0.ffn_gate_inp_shexp.weight", "model.layers.0.mlp.shared_expert.gate.weight"),
     ("blk.0.ffn_gate_shexp.weight", "model.layers.0.mlp.shared_expert.gate_proj.weight"),
     ("blk.0.ffn_down_shexp.weight", "model.layers.0.mlp.shared_expert.down_proj.weight"),
     ("blk.0.ffn_up_shexp.weight", "model.layers.0.mlp.shared_expert.up_proj.weight"),
-    ("blk.39.attn_q.weight", "model.layers.39.attn.q_proj.weight"),
+    ("blk.39.attn_q.weight", "model.layers.39.self_attn.q_proj.weight"),
     ("blk.39.attn_qkv.weight", "model.layers.39.linear_attn.in_proj_qkv.weight"),
-    ("nextn.eh_proj.weight", "model.mtp.eh_proj.weight"),
+    ("nextn.eh_proj.weight", "model.mtp.fc.weight"),
     ("nextn.eh_norm.weight", "model.mtp.eh_norm.weight"),
 ]
 
@@ -138,10 +138,12 @@ def test_make_qwen35moe_gguf_map_experts_are_flat_per_expert():
     assert m["blk.0.ffn_gate_exps.weight"] == "model.layers.0.mlp.experts.gate_proj.weight"
     assert m["blk.0.ffn_up_exps.weight"] == "model.layers.0.mlp.experts.up_proj.weight"
     assert m["blk.0.ffn_down_exps.weight"] == "model.layers.0.mlp.experts.down_proj.weight"
-    assert m["blk.2.nextn.eh_proj.weight"] == "model.mtp.eh_proj.weight"
-    assert m["blk.2.nextn.enorm.weight"] == "model.mtp.enorm.weight"
-    assert m["blk.2.nextn.hnorm.weight"] == "model.mtp.hnorm.weight"
-    assert m["blk.2.nextn.shared_head_norm.weight"] == "model.mtp.shared_head_norm.weight"
+    assert m["nextn.eh_proj.weight"] == "model.mtp.fc.weight"
+    assert m["nextn.eh_norm.weight"] == "model.mtp.eh_norm.weight"
+    assert m["blk.2.nextn.eh_proj.weight"] == "model.mtp.fc.weight"
+    assert m["blk.2.nextn.enorm.weight"] == "model.mtp.pre_fc_norm_embedding.weight"
+    assert m["blk.2.nextn.hnorm.weight"] == "model.mtp.pre_fc_norm_hidden.weight"
+    assert m["blk.2.nextn.shared_head_norm.weight"] == "model.mtp.norm.weight"
 
 
 # ---- loader hook 测试 (依赖 sglang) ----
@@ -211,7 +213,7 @@ def test_loader_hook_dispatches_qwen35moe_to_custom():
         model_config = type("MC", (), {"hf_config": cfg})()
         model_config.model_path = "/tmp/qwen35moe-gguf"
         m = GGUFModelLoader(_fake_load_config())._get_gguf_weights_map(model_config)
-        assert m["blk.0.attn_q.weight"] == "model.layers.0.attn.q_proj.weight"
+        assert m["blk.0.attn_q.weight"] == "model.layers.0.self_attn.q_proj.weight"
         assert m["blk.1.ffn_gate_exps.3.weight"] == "model.layers.1.mlp.experts.3.gate_proj.weight"
     finally:
         uninstall_gguf_qwen35moe()

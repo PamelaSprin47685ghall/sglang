@@ -21,6 +21,36 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Set, Tuple, Union
 
+# ---------------------------------------------------------------------------
+# Side-effect import: register kt_ep_wrapper (KT Flash CPU/GPU expert
+# parallelism) into quant_method_registry so that FusedMoE layers in this
+# model can dispatch routed experts to CPU via LlamafileMoEWrapper.
+#
+# Pattern taken from deepseek_v4.py lines 33-47: each side-effect import is
+# wrapped in try/except so that a missing or broken dependency does not
+# prevent the model class from registering.  If kt_ep_wrapper is unavailable,
+# MoE dispatch falls back to the standard GPU-only FusedMoE path and the user
+# sees a warning rather than a crash at import time.
+# ---------------------------------------------------------------------------
+import logging as _qwen35_logging
+
+_qwen35_import_log = _qwen35_logging.getLogger(__name__)
+
+
+def _try_side_effect(import_path: str) -> None:
+    try:
+        __import__(import_path)
+    except Exception as exc:  # noqa: BLE001
+        _qwen35_import_log.warning(
+            "Qwen3.5 side-effect import failed: %s -> %s. "
+            "MoE layers will use the standard GPU-only FusedMoE path.",
+            import_path,
+            exc,
+        )
+
+
+_try_side_effect("sglang.srt.layers.moe.kt_ep_wrapper")
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -66,6 +96,7 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_loader.gguf_qwen35moe import get_out_proj_activation_perm
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -86,6 +117,80 @@ _is_npu = is_npu()
 
 def _is_mtp_or_nextn_weight(name: str) -> bool:
     return "mtp" in name or ".nextn." in name
+
+
+def _is_gguf_flat_text_checkpoint_name(name: str) -> bool:
+    if name.startswith("model.layers."):
+        return True
+    if name.startswith("model.embed_tokens") or name.startswith("model.norm"):
+        return True
+    if name.startswith("model.lm_head") or name.startswith("lm_head."):
+        return True
+    return False
+
+
+def _checkpoint_name_to_model_param(name: str) -> str:
+    if "language_model" in name or name.startswith("visual.") or name.startswith(
+        "model.visual."
+    ):
+        return name
+    if _is_gguf_flat_text_checkpoint_name(name):
+        return _map_gguf_text_name_to_vl_param(name)
+    return name
+
+
+def _enable_gguf_linear_attn_out_proj_perms(root: nn.Module) -> None:
+    layer_lists = []
+    if hasattr(root, "layers"):
+        layer_lists.append(root.layers)
+    inner = getattr(root, "model", None)
+    if inner is not None:
+        if hasattr(inner, "layers"):
+            layer_lists.append(inner.layers)
+        lm = getattr(inner, "language_model", None)
+        if lm is not None and hasattr(lm, "layers"):
+            layer_lists.append(lm.layers)
+    seen: Set[int] = set()
+    for layers in layer_lists:
+        for layer in layers:
+            if id(layer) in seen:
+                continue
+            seen.add(id(layer))
+            la = getattr(layer, "linear_attn", None)
+            if la is not None and hasattr(la, "enable_gguf_out_proj_activation_perm"):
+                la.enable_gguf_out_proj_activation_perm()
+
+
+def _map_gguf_text_name_to_vl_param(name: str) -> str:
+    """GGUF custom map uses flat ``model.layers.*``; VL ``named_parameters`` use ``model.language_model.*``."""
+    if "language_model" in name or name.startswith("visual.") or name.startswith("model.visual."):
+        return name
+    if name.startswith("model.lm_head."):
+        return name.replace("model.lm_head.", "lm_head.", 1)
+    if name == "model.lm_head.weight" or name.startswith("model.lm_head"):
+        return name.replace("model.lm_head", "lm_head", 1)
+    if name.startswith("model.embed_tokens"):
+        return name.replace("model.embed_tokens", "model.language_model.embed_tokens", 1)
+    if name.startswith("model.norm"):
+        return name.replace("model.norm", "model.language_model.norm", 1)
+    if name.startswith("model.layers."):
+        return name.replace("model.layers.", "model.language_model.layers.", 1)
+    return name
+
+
+def _normalize_qwen35_checkpoint_name(name: str) -> str:
+    if "language_model" in name:
+        name = name.replace(r"model.language_model.", r"model.")
+    if ".self_attn." in name:
+        name = name.replace(".self_attn", "")
+    return name
+
+
+def _qwen35_moe_num_experts(config) -> int:
+    text_config = getattr(config, "text_config", None)
+    if text_config is not None and getattr(text_config, "num_experts", None) is not None:
+        return text_config.num_experts
+    return config.num_experts
 
 cached_get_processor = lru_cache(get_processor)
 
@@ -386,6 +491,27 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self._kt_lora_in_proj_b: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._kt_lora_in_proj_a: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._kt_lora_out_proj: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self.register_buffer(
+            "_gguf_out_proj_act_perm",
+            torch.tensor([], dtype=torch.long),
+            persistent=False,
+        )
+
+    def enable_gguf_out_proj_activation_perm(self) -> None:
+        if self._gguf_out_proj_act_perm.numel() > 0:
+            return
+        v_per_k = self.num_v_heads // self.num_k_heads
+        perm = get_out_proj_activation_perm(
+            v_per_k, self.num_k_heads, self.head_v_dim
+        )
+        self._gguf_out_proj_act_perm = perm.to(
+            device=self.out_proj.weight.device, dtype=torch.long
+        )
+
+    def _out_proj_linear_input(self, core_attn_out: torch.Tensor) -> torch.Tensor:
+        if self._gguf_out_proj_act_perm.numel() == 0:
+            return core_attn_out
+        return core_attn_out.index_select(-1, self._gguf_out_proj_act_perm)
 
     def load_kt_lora(
         self,
@@ -513,10 +639,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
-        output, _ = self.out_proj(core_attn_out)
+        out_in = self._out_proj_linear_input(core_attn_out)
+        output, _ = self.out_proj(out_in)
         if self._kt_lora_out_proj is not None:
             output = output + _lora_delta(
-                core_attn_out,
+                out_in,
                 self._kt_lora_out_proj[0],
                 self._kt_lora_out_proj[1],
                 self._kt_lora_scale,
@@ -1211,7 +1338,11 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        saw_gguf_checkpoint = False
         for name, loaded_weight in weights:
+            ckpt_name = name
+            if _is_gguf_flat_text_checkpoint_name(ckpt_name) or ".qweight" in ckpt_name:
+                saw_gguf_checkpoint = True
             if "rotary_emb.inv_freq" in name:
                 continue
             if _is_mtp_or_nextn_weight(name):
@@ -1221,38 +1352,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 continue
             if "visual" in name:
                 continue
-            if "language_model" in name:
-                name = name.replace(r"model.language_model.", r"model.")
-            if ".self_attn." in name:
-                name = name.replace(".self_attn", "")
-
-            if ".mlp.experts.gate_proj.weight" in name:
-                load_fused_expert_weights(
-                    name.replace("experts.gate_proj.weight", "experts.w13_weight"),
-                    params_dict,
-                    loaded_weight,
-                    "w1",
-                    num_experts,
-                )
-                continue
-            if ".mlp.experts.up_proj.weight" in name:
-                load_fused_expert_weights(
-                    name.replace("experts.up_proj.weight", "experts.w13_weight"),
-                    params_dict,
-                    loaded_weight,
-                    "w3",
-                    num_experts,
-                )
-                continue
-            if ".mlp.experts.down_proj.weight" in name:
-                load_fused_expert_weights(
-                    name.replace("experts.down_proj.weight", "experts.w2_weight"),
-                    params_dict,
-                    loaded_weight,
-                    "w2",
-                    num_experts,
-                )
-                continue
+            name = _normalize_qwen35_checkpoint_name(name)
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -1375,10 +1475,21 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 continue
             if "visual" in name:
                 continue
-            if "language_model" in name:
-                name = name.replace(r"model.language_model.", r"model.")
-            if ".self_attn." in name:
-                name = name.replace(".self_attn", "")
+            name = _normalize_qwen35_checkpoint_name(name)
+
+            if (
+                name.endswith(".mlp.experts.w13_qweight")
+                or name.endswith(".mlp.experts.w2_qweight")
+                or name.endswith(".mlp.experts.w13_qweight_type")
+                or name.endswith(".mlp.experts.w2_qweight_type")
+            ):
+                if name in params_dict:
+                    param = params_dict[name]
+                    # GGUF fused expert tensors use default_weight_loader,
+                    # not FusedMoE.weight_loader which expects expert_id.
+                    default_weight_loader(param, loaded_weight)
+                    loaded_params.add(name)
+                continue
 
             if ".mlp.experts.gate_proj.weight" in name:
                 load_fused_expert_weights(
@@ -1514,6 +1625,8 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
 
+        if saw_gguf_checkpoint:
+            _enable_gguf_linear_attn_out_proj_perms(self)
         return loaded_params
 
 
@@ -1566,7 +1679,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        saw_gguf_checkpoint = False
         for name, loaded_weight in weights:
+            if _is_gguf_flat_text_checkpoint_name(name) or ".qweight" in name:
+                saw_gguf_checkpoint = True
             if "rotary_emb.inv_freq" in name:
                 continue
             if _is_mtp_or_nextn_weight(name):
@@ -1574,10 +1690,13 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     "Skipping qwen3.5 MTP/nextn weights during main model load."
                 )
                 continue
-            if "language_model" in name:
-                name = name.replace(r"model.language_model.", r"model.")
+            # GGUF custom-mapped names already match SGLang named_parameters
+            # format (model.layers.*, model.embed_tokens.*, lm_head.*).
+            # HF safetensors names with "language_model" pass through unchanged.
+            name = _checkpoint_name_to_model_param(name)
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -1617,6 +1736,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
+        if saw_gguf_checkpoint:
+            _enable_gguf_linear_attn_out_proj_perms(self)
         return loaded_params
 
 
@@ -1637,14 +1758,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.is_mrope_enabled = "mrope_section" in rope_config
 
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
-
-    @classmethod
-    def get_model_config_for_expert_location(cls, config):
-        return ModelConfigForExpertLocation(
-            num_layers=config.text_config.num_hidden_layers,
-            num_logical_experts=config.text_config.num_experts,
-            num_groups=None,
-        )
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
@@ -1678,11 +1791,12 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
+        num_experts = _qwen35_moe_num_experts(self.config)
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=num_experts,
         )
 
         # Skip loading extra parameters for GPTQ/modelopt models.
@@ -1702,8 +1816,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
             ("experts.w2_weight", "experts.down_proj", 0, "w2"),
         ]
-
-        num_experts = self.config.num_experts
 
         def load_fused_expert_weights(
             name: str,
@@ -1728,8 +1840,11 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        saw_gguf_checkpoint = False
 
         for name, loaded_weight in weights:
+            if _is_gguf_flat_text_checkpoint_name(name) or ".qweight" in name:
+                saw_gguf_checkpoint = True
             if "rotary_emb.inv_freq" in name:
                 continue
             if _is_mtp_or_nextn_weight(name):
@@ -1737,10 +1852,13 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     "Skipping qwen3.5 MTP/nextn weights during main model load."
                 )
                 continue
-            if "language_model" in name:
-                name = name.replace(r"model.language_model.", r"model.")
+            # GGUF custom-mapped names already match SGLang named_parameters
+            # format (model.layers.*, model.embed_tokens.*, lm_head.*).
+            # HF safetensors names with "language_model" pass through unchanged.
+            name = _checkpoint_name_to_model_param(name)
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if name.endswith("experts.gate_up_proj") or name.endswith(
@@ -1849,6 +1967,103 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     if name.endswith(ignore_suffixes) and name not in params_dict:
                         continue
 
+                    # GGUF on-the-fly path: the Qwen3.5 GatedDeltaNet in_proj_qkv
+                    # is implemented as a single ``MergedColumnParallelLinear`` with
+                    # ``output_sizes=[key_dim, key_dim, value_dim]``. GGUF
+                    # does not natively know about this fused layout, so we
+                    # slice the GGUF buffer here into (q, k, v) shards and
+                    # call the underlying weight_loader with the proper
+                    # string shard id. This populates ``shard_id_map`` so
+                    # ``_create_padded_weight_param`` can build
+                    # ``shard_offset_map`` later.
+                    if name in (
+                        "model.layers.{idx}.linear_attn.in_proj_qkv.qweight",
+                    ) or name.endswith(
+                        "linear_attn.in_proj_qkv.qweight"
+                    ):
+                        if name not in params_dict:
+                            loaded_params.add(name)
+                            continue
+                        param = params_dict[name]
+                        w_loader = param.weight_loader
+                        cfg = (
+                            getattr(self.config, "text_config", self.config)
+                        )
+                        key_dim = (
+                            cfg.linear_key_head_dim
+                            * cfg.linear_num_key_heads
+                        )
+                        value_dim = (
+                            cfg.linear_value_head_dim
+                            * cfg.linear_num_value_heads
+                        )
+                        if (
+                            loaded_weight.dim() == 2
+                            and loaded_weight.size(0)
+                            == key_dim + key_dim + value_dim
+                        ):
+                            for shard_id, sl in zip(
+                                (0, 1, 2),
+                                (
+                                    (0, key_dim),
+                                    (key_dim, key_dim * 2),
+                                    (key_dim * 2, key_dim * 2 + value_dim),
+                                ),
+                            ):
+                                w_loader(
+                                    param,
+                                    loaded_weight[sl[0] : sl[1]].contiguous(),
+                                    shard_id,
+                                )
+                            loaded_params.add(name)
+                            continue
+                    if name.endswith(
+                        "linear_attn.in_proj_qkv.qweight_type"
+                    ):
+                        if name not in params_dict:
+                            loaded_params.add(name)
+                            continue
+                        param = params_dict[name]
+                        w_loader = param.weight_loader
+                        if (
+                            loaded_weight.dim() == 0
+                            or loaded_weight.numel() == 1
+                        ):
+                            w_type_int = int(loaded_weight.item())
+                            w_tensor = torch.tensor(w_type_int, dtype=torch.uint8)
+                            for shard_id in (0, 1, 2):
+                                w_loader(param, w_tensor, shard_id)
+                            loaded_params.add(name)
+                            continue
+
+                    # GGUF on-the-fly path: the Qwen3.5 MoE expert
+                    # weights are stored as a single fused
+                    # ``[num_experts, ...]`` GGUF buffer. The SGLang
+                    # ``FusedMoE`` exposes them as ``w13_qweight`` /
+                    # ``w2_qweight`` (GGUFUninitializedParameter) on
+                    # the experts ``Module``. The fork iterator yields
+                    # those GGUF tensors under the registered FusedMoE
+                    # param name (e.g. ``...mlp.experts.w13_qweight``);
+                    # the default ``weight_loader`` path then calls
+                    # ``FusedMoE.weight_loader`` with the full
+                    # ``[num_experts, ...]`` buffer. FusedMoE itself
+                    # takes care of materialising the parameter to
+                    # that shape; we just need to make sure the
+                    # default path is the one that's taken.
+                    if (
+                        name.endswith(".mlp.experts.w13_qweight")
+                        or name.endswith(".mlp.experts.w2_qweight")
+                        or name.endswith(".mlp.experts.w13_qweight_type")
+                        or name.endswith(".mlp.experts.w2_qweight_type")
+                    ):
+                        if name in params_dict.keys():
+                            param = params_dict[name]
+                            # GGUF fused expert tensors use default_weight_loader,
+                            # not FusedMoE.weight_loader which expects expert_id.
+                            default_weight_loader(param, loaded_weight)
+                            loaded_params.add(name)
+                            continue
+
                     if name in params_dict.keys():
                         param = params_dict[name]
                         weight_loader = getattr(
@@ -1859,6 +2074,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
 
+        if saw_gguf_checkpoint:
+            _enable_gguf_linear_attn_out_proj_perms(self)
         return loaded_params
 
     @classmethod

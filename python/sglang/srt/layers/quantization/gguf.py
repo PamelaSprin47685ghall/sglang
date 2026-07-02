@@ -445,6 +445,12 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         quant_config: The GGUF quantization config.
     """
 
+    # Some SGLang MoE dispatchers (e.g. fused_moe_triton.layer) check
+    # ``self.fused_experts is None``; we never set this attribute, so
+    # declaring it as a class attribute of value ``None`` keeps the
+    # assert happy and signals that the GGUF method is its own runner.
+    fused_experts = None
+
     def __init__(self, quant_config: GGUFConfig):
         self.quant_config = quant_config
 

@@ -8,6 +8,7 @@ from sglang.srt.model_loader.gguf_qwen35moe import (
     alog_transform,
     conv1d_reorder,
     v_head_tiled_to_grouped,
+    get_out_proj_activation_perm,
     apply_f32_transforms,
 )
 
@@ -79,20 +80,18 @@ def test_alog_transform_pure():
 
 
 def test_conv1d_reorder_shape_and_v_flip():
-    kernel, qk_ch, v_ch = 4, 4, 8
-    out_ch = qk_ch + v_ch
-    w = torch.zeros(kernel, out_ch, dtype=torch.float32)
-    w[:, qk_ch:] = torch.arange(kernel * v_ch, dtype=torch.float32).reshape(
-        kernel, v_ch
-    )
+    # The Qwen3.5 GatedDeltaNet ``ssm_conv1d`` is stored by llama.cpp as
+    # ``(out=8192, kernel=4)``; the gguf-py reader already reverses
+    # the axis order, so ``tensor.data`` is already the (out, kernel)
+    # layout. ``conv1d_reorder`` therefore just returns a contiguous copy
+    # without any axis swap. SGLang's Qwen3_5GatedDeltaNet treats this
+    # buffer as the concat of two q/k convs plus the v conv and adds
+    # the in_channel axis via ``unsqueeze(1)`` in its constructor.
+    kernel, out_ch = 4, 12
+    w = torch.arange(kernel * out_ch, dtype=torch.float32).reshape(out_ch, kernel)
     r = conv1d_reorder(w, num_v_per_k=2, k_heads=2, head_dim=2)
-    assert r.shape == (kernel, 1, out_ch)
-    # Q/K 段不变
-    assert torch.equal(r[:, 0, :qk_ch], w[:, :qk_ch])
-    # V 段反序 (num_v_per_k=2)
-    v_old = w[:, qk_ch:].reshape(kernel, 2, 2, 2)
-    v_new = r[:, 0, qk_ch:].reshape(kernel, 2, 2, 2)
-    assert torch.equal(v_new, v_old.flip(1))
+    assert r.shape == (out_ch, kernel)
+    assert torch.equal(r, w)
 
 
 def test_conv1d_reorder_pure():
@@ -119,6 +118,18 @@ def test_v_head_tiled_to_grouped_pure():
     assert torch.equal(w, w_copy)
 
 
+def test_get_out_proj_activation_perm_aligns_tiled_activation_to_grouped_layout():
+    v_per_k, k_heads, head_dim = 2, 4, 8
+    perm = get_out_proj_activation_perm(v_per_k, k_heads, head_dim)
+    tiled = torch.arange(v_per_k * k_heads * head_dim, dtype=torch.float32)
+    grouped = (
+        tiled.reshape(v_per_k, k_heads, head_dim).permute(1, 0, 2).flatten()
+    )
+    # index_select(-1, perm): out[j] = tiled[perm[j]] must equal grouped layout.
+    out_in = tiled.index_select(-1, perm)
+    assert torch.equal(out_in, grouped)
+
+
 # ---- apply_f32_transforms 分派测试 ----
 
 
@@ -136,10 +147,13 @@ def test_apply_f32_transforms_ssm_a():
 
 
 def test_apply_f32_transforms_conv1d():
-    w = torch.arange(4 * 2, dtype=torch.float32).reshape(4, 2)
+    w = torch.arange(4 * 2, dtype=torch.float32).reshape(2, 4)
     r = apply_f32_transforms(w, "blk.2.ssm_conv1d.weight")
-    assert r.shape == (4, 1, 2)
-    assert r[0, 0, 1] == w[0, 1]
+    # The gguf-py reader already reverses the axis order, so no transpose
+    # is needed. SGLang's constructor adds the in_channel axis via
+    # unsqueeze(1).
+    assert r.shape == (2, 4)
+    assert torch.equal(r, w)
 
 
 def test_apply_f32_transforms_linear_attn_norm_passthrough():

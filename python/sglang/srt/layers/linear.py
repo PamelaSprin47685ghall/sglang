@@ -379,9 +379,10 @@ class ColumnParallelLinear(LinearBase):
         if is_gguf_weight_type:
             param.weight_type = loaded_weight.item()
 
-        # Materialize GGUF UninitializedParameter
+        # Materialize GGUF UninitializedParameter (refreshes `param.data`).
         if is_gguf_weight and isinstance(param, UninitializedParameter):
             param.materialize(loaded_weight.shape, dtype=loaded_weight.dtype)
+            param_data = param.data
 
         # bitsandbytes loads the weights of the specific portion
         # no need to narrow here

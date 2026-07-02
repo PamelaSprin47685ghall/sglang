@@ -527,12 +527,23 @@ def get_config(
     if model_override_args:
         config.update(model_override_args)
 
-    # Special architecture mapping check for GGUF models
+    # Special architecture mapping check for GGUF models.
+    # Preserve the original multi-modal architectures if present (e.g.
+    # ``Qwen3_5MoeForConditionalGeneration``) so SGLang can dispatch to the
+    # Conditional Generation class; only fall back to the causal LM mapping
+    # when no multi-modal class is available.
     if is_gguf:
+        original_archs = list(getattr(config, "architectures", []) or [])
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
             raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
-        model_type = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]
-        config.update({"architectures": [model_type]})
+        # Keep the multi-modal ConditionalGeneration arch (with text_config) so
+        # SGLang's model registry can dispatch to the right class.
+        if not any(
+            arch.endswith("ForConditionalGeneration")
+            for arch in original_archs
+        ):
+            model_type = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]
+            config.update({"architectures": [model_type]})
 
     return config
 

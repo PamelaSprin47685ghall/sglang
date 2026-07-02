@@ -222,6 +222,11 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 # Remove the mtp. prefix for processing
                 name = name.replace("mtp.", "model.")
 
+                # Handle GGUF nextn mappings
+                name = name.replace("model.model.mtp.fc", "fc")
+                name = name.replace("model.model.mtp.pre_fc", "pre_fc")
+                name = name.replace("model.model.mtp.norm", "model.norm")
+
                 name = name.replace("model.fc", "fc")
                 name = name.replace("model.pre_fc", "pre_fc")
 

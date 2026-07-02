@@ -5,6 +5,7 @@ from enum import Enum
 from typing import List, Optional, Tuple
 
 import torch
+from torch.nn.parameter import UninitializedParameter
 
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
@@ -585,10 +586,51 @@ class FusedMoE(torch.nn.Module):
         self,
         param: torch.nn.Parameter,
         loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: Optional[int],
+        weight_name: str = "",
+        shard_id: str = "",
+        expert_id: Optional[int] = None,
     ) -> None:
+        # Fast path: when the GGUF iterator yields the full
+        # ``[num_experts, ...]`` fused tensor (expert_id is None and
+        # loaded_weight already has the num_experts leading axis),
+        # materialise and copy directly. This avoids the per-expert
+        # loop and the None-vs-int comparison downstream.
+        if (
+            expert_id is None
+            and getattr(param, "is_gguf_weight", False)
+            and isinstance(param, UninitializedParameter)
+            and loaded_weight.ndim >= 2
+            and loaded_weight.shape[0] == getattr(self, "num_experts", -1)
+        ):
+            param.materialize(loaded_weight.shape, dtype=loaded_weight.dtype)
+            param.data.copy_(loaded_weight)
+            return
+
+        # Materialize GGUF UninitializedParameter on the first call.
+        # The SGLang GGUF MoE method creates ``w13_qweight`` /
+        # ``w2_qweight`` as ``UninitializedParameter``s; accessing
+        # ``param.data`` without first materializing raises
+        # "Attempted to use an uninitialized parameter".
+        # The fork iterator yields the full ``[num_experts, ...]``
+        # tensor and the loader walks ``range(num_experts)`` itself,
+        # so each ``loaded_weight`` here is a single-expert 2D slice.
+        # The materialised parameter must keep the leading
+        # ``num_experts`` axis to satisfy ``FusedMoE.forward``.
+        if (
+            getattr(param, "is_gguf_weight", False)
+            and isinstance(param, UninitializedParameter)
+        ):
+            num_experts = getattr(self, "num_experts", None)
+            if num_experts is None:
+                full_shape = loaded_weight.shape
+            elif loaded_weight.ndim >= 2 and loaded_weight.shape[0] == num_experts:
+                # The fork iterator yields the full fused tensor
+                # ``[num_experts, 2 * intermediate, ...]`` already;
+                # do not prepend ``num_experts`` again.
+                full_shape = loaded_weight.shape
+            else:
+                full_shape = (num_experts,) + tuple(loaded_weight.shape)
+            param.materialize(full_shape, dtype=loaded_weight.dtype)
         # if expert_id is None, then
         # all the experts are loaded at the same time
         if (
@@ -695,6 +737,32 @@ class FusedMoE(torch.nn.Module):
         expert_id: int,
     ) -> None:
         tp_rank = self.moe_tp_rank
+
+        # Materialize GGUF UninitializedParameter on the first call.
+        # The SGLang GGUF MoE method creates ``w13_qweight`` /
+        # ``w2_qweight`` as ``UninitializedParameter``s; accessing
+        # ``param.data`` without first materializing raises
+        # "Attempted to use an uninitialized parameter".
+        # The fork iterator yields the full ``[num_experts, ...]``
+        # tensor and the loader walks ``range(num_experts)`` itself,
+        # so each ``loaded_weight`` here is a single-expert 2D slice.
+        # The materialised parameter must keep the leading
+        # ``num_experts`` axis to satisfy ``FusedMoE.forward``.
+        if (
+            getattr(param, "is_gguf_weight", False)
+            and isinstance(param, UninitializedParameter)
+        ):
+            num_experts = getattr(self, "num_experts", None)
+            if num_experts is None:
+                full_shape = loaded_weight.shape
+            elif loaded_weight.ndim >= 2 and loaded_weight.shape[0] == num_experts:
+                # The fork iterator yields the full fused tensor
+                # ``[num_experts, 2 * intermediate, ...]`` already;
+                # do not prepend ``num_experts`` again.
+                full_shape = loaded_weight.shape
+            else:
+                full_shape = (num_experts,) + tuple(loaded_weight.shape)
+            param.materialize(full_shape, dtype=loaded_weight.dtype)
 
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO (mgoin): check self.quant_method.quant_config.quant_format

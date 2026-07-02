@@ -969,35 +969,117 @@ def get_gguf_extra_tensor_names(
 def gguf_quant_weights_iterator(
     gguf_file: str, gguf_to_hf_name_map: Dict[str, str]
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-    """
-    Iterate over the quant weights in the model gguf files and convert
-    them to torch tensors
-    """
+    """Iterate GGUF tensors and yield HF-named torch tensors for SGLang load."""
 
     import gguf
 
     reader = gguf.GGUFReader(gguf_file)
+    tensor_names = {t.name for t in reader.tensors}
+
+    try:
+        from sglang.srt.model_loader.gguf_qwen35moe import (
+            apply_f32_transforms as _qwen35_f32,
+        )
+    except Exception:
+        _qwen35_f32 = None
+
+    gate_exps: Dict[str, torch.Tensor] = {}
+    for tensor in reader.tensors:
+        if tensor.name.startswith("blk.") and tensor.name.endswith(
+            ".ffn_gate_exps.weight"
+        ):
+            gate_exps[tensor.name] = torch.tensor(tensor.data)
 
     for tensor in reader.tensors:
-        if tensor.name in gguf_to_hf_name_map:
-            weight_type = tensor.tensor_type
-            name = gguf_to_hf_name_map[tensor.name]
+        if tensor.name not in gguf_to_hf_name_map:
+            continue
 
-            if weight_type.name != "F32":
-                weight_type_name = name.replace("weight", "qweight_type")
-                weight_type = torch.tensor(weight_type)
-                yield weight_type_name, weight_type
+        gt = tensor.name
+        weight = tensor.data
+        weight_type = tensor.tensor_type
+        name = gguf_to_hf_name_map[gt]
 
-    for tensor in reader.tensors:
-        if tensor.name in gguf_to_hf_name_map:
-            weight = tensor.data
-            weight_type = tensor.tensor_type
-            name = gguf_to_hf_name_map[tensor.name]
+        is_gate = gt.startswith("blk.") and gt.endswith(".ffn_gate_exps.weight")
+        is_up = gt.startswith("blk.") and gt.endswith(".ffn_up_exps.weight")
+        is_down = gt.startswith("blk.") and gt.endswith(".ffn_down_exps.weight")
+        is_moe_expert = is_gate or is_up or is_down
 
-            if weight_type.name != "F32":
-                name = name.replace("weight", "qweight")
-            param = torch.tensor(weight)
-            yield name, param
+        # MoE expert weights are managed by kt-kernel LlamafileMoEWrapper
+        # via GGUFLoader mmap — skip them here to avoid double-loading into
+        # GPU memory.
+        if is_moe_expert:
+            continue
+
+        if weight_type.name != "F32":
+            if is_gate:
+                pass
+            elif is_up:
+                w13_type = name.replace(
+                    ".mlp.experts.up_proj.weight", ".mlp.experts.w13_qweight_type"
+                ).replace("weight", "qweight_type")
+                if "w13_qweight_type" not in w13_type:
+                    w13_type = name.replace(
+                        ".mlp.experts.up_proj.weight",
+                        ".mlp.experts.w13_qweight_type",
+                    )
+                yield name.replace(
+                    ".mlp.experts.up_proj.weight", ".mlp.experts.w13_qweight_type"
+                ), torch.tensor(weight_type)
+            elif is_down:
+                yield name.replace(
+                    ".mlp.experts.down_proj.weight", ".mlp.experts.w2_qweight_type"
+                ).replace("down_proj.weight", "w2_qweight_type"), torch.tensor(
+                    weight_type
+                )
+            elif gt.endswith(".attn_qkv.weight"):
+                type_name = name.replace("weight", "qweight_type")
+                w_type_t = torch.tensor(weight_type)
+                for _ in range(3):
+                    yield type_name, w_type_t
+            else:
+                yield name.replace("weight", "qweight_type"), torch.tensor(
+                    weight_type
+                )
+
+        if weight_type.name != "F32" and not is_moe_expert:
+            name = name.replace("weight", "qweight")
+
+        param = torch.tensor(weight)
+
+        if _qwen35_f32 is not None and weight_type.name == "F32":
+            param = _qwen35_f32(param, gt)
+
+        if (
+            _qwen35_f32 is not None
+            and weight_type.name == "F32"
+            and gt.endswith("ssm_conv1d.weight")
+            and param.ndim == 2
+        ):
+            param = param.unsqueeze(1)
+
+        if is_up:
+            gate_key = gt.replace("ffn_up_exps.weight", "ffn_gate_exps.weight")
+            gate_t = gate_exps.pop(gate_key, None)
+            if gate_t is not None:
+                param = torch.cat([gate_t, param], dim=1)
+            yield name.replace(
+                ".mlp.experts.up_proj.weight", ".mlp.experts.w13_qweight"
+            ), param
+            continue
+
+        if is_down:
+            yield name.replace(
+                ".mlp.experts.down_proj.weight", ".mlp.experts.w2_qweight"
+            ), param
+            continue
+
+        if is_gate:
+            up_key = gt.replace("ffn_gate_exps.weight", "ffn_up_exps.weight")
+            if up_key not in tensor_names:
+                yield name, param
+            continue
+
+        yield name, param
 
 
 def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
@@ -1018,6 +1100,30 @@ def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
     try:
+        # Materialize UninitializedParameter (e.g. GGUF qweight) so the
+        # shape comparison below reflects the real tensor. The actual
+        # copy_() below will then write into the freshly allocated
+        # storage.
+        from torch.nn.parameter import UninitializedParameter
+
+        if isinstance(param, UninitializedParameter) or (
+            type(param).__name__ == "GGUFUninitializedParameter"
+        ):
+            materialize_args = getattr(param, "materialize_args", None)
+            if materialize_args is not None:
+                param.materialize(
+                    *materialize_args["shape"],
+                    dtype=materialize_args.get("dtype"),
+                    device=materialize_args.get("device"),
+                )
+            else:
+                # Fall back: build a zero tensor matching the loaded weight
+                # shape and copy.
+                param = torch.nn.Parameter(
+                    torch.empty_like(loaded_weight),
+                    requires_grad=param.requires_grad,
+                )
+
         if param.numel() == 1 and loaded_weight.numel() == 1:
             # Sometimes scalar values aren't considered tensors with shapes
             # so if both param and loaded_weight are a scalar,

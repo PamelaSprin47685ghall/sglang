@@ -118,6 +118,30 @@ def test_iterator_conv1d_matches_export_v_reorder():
     assert torch.allclose(w.float(), ref.float(), atol=1e-5)
 
 
+def test_shared_expert_down_q6k_fused_matches_dequant_row_layout():
+    import numpy as np
+    from gguf import GGUFReader
+
+    from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
+
+    if not torch.cuda.is_available():
+        return
+    path = "/home/kunweiz/Desktop/Ornith/ornith-gguf-runtime/ornith-gpu-non-expert.gguf"
+    gt = "blk.0.ffn_down_shexp.weight"
+    t = next(x for x in GGUFReader(path).tensors if x.name == gt)
+    raw = torch.tensor(np.array(t.data)).cuda()
+    dense = (
+        torch.from_numpy(np.array(gguf.dequantize(np.array(t.data), t.tensor_type)))
+        .float()
+        .cuda()
+    )
+    assert dense.shape == (2048, 512)
+    x = torch.randn(2, 512, dtype=torch.float16, device="cuda")
+    y = fused_mul_mat_gguf(x, raw, int(t.tensor_type))
+    y_ref = x.float() @ dense.T
+    assert torch.allclose(y.float(), y_ref, atol=0.02, rtol=0.01)
+
+
 def test_mlp_gate_f32_loader_layout_matches_linear():
     from sglang.srt.model_loader.gguf_qwen35moe import qwen35moe_gguf_to_hf
 

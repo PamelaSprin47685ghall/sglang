@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable, Dict, Optional
 
 
 _original_get_gguf_weights_map: Optional[Callable] = None
+logger = logging.getLogger(__name__)
 
 
 def _extract_qwen35moe_params(model_config: Any) -> Optional[Dict[str, Any]]:
@@ -69,6 +71,7 @@ def install_gguf_qwen35moe() -> None:
         if _is_qwen35moe_config(model_config):
             params = _extract_qwen35moe_params(model_config)
             if params is not None:
+                logger.info("Activating qwen35moe GGUF name-map hook.")
                 from sglang.srt.model_loader.gguf_qwen35moe import make_qwen35moe_gguf_map
 
                 return make_qwen35moe_gguf_map(**params)

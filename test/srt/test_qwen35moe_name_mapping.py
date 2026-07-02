@@ -190,3 +190,29 @@ def test_loader_hook_dispatches_qwen35moe_to_custom():
         assert m["blk.1.ffn_gate_exps.3.weight"] == "model.layers.1.mlp.experts.3.gate_proj.weight"
     finally:
         uninstall_gguf_qwen35moe()
+
+
+def test_loader_hook_logs_activation(caplog):
+    from sglang.srt.model_loader.loader import GGUFModelLoader
+
+    install_gguf_qwen35moe()
+    try:
+        cfg = type("C", (), {
+            "model_type": "qwen3_5_moe",
+            "num_hidden_layers": 2,
+            "hidden_size": 64,
+            "vocab_size": 100,
+            "intermediate_size": 128,
+            "num_experts": 4,
+            "num_experts_per_tok": 1,
+            "num_key_value_heads": 2,
+            "num_attention_heads": 8,
+            "text_config": None,
+            "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+        })()
+        model_config = type("MC", (), {"hf_config": cfg})()
+        with caplog.at_level("INFO"):
+            GGUFModelLoader(_fake_load_config())._get_gguf_weights_map(model_config)
+        assert "Activating qwen35moe GGUF name-map hook." in caplog.text
+    finally:
+        uninstall_gguf_qwen35moe()

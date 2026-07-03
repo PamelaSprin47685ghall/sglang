@@ -350,14 +350,21 @@ def qwen35_gguf_dequant_apply_for_load(w, hf_name: str, cfg: dict):
     import torch
 
     dense = w.float() if isinstance(w, torch.Tensor) else torch.from_numpy(w).float()
-    if hf_name.endswith(
-        (
-            ".in_proj_z.weight",
-            ".in_proj_a.weight",
-            ".in_proj_b.weight",
-        )
-    ):
-        return qwen35_gguf_dense_for_gguf_linear(dense, hf_name, cfg)
+    hidden = _qwen35_hidden_size(cfg)
+    key_dim, value_dim, _ = _linear_attn_dims(cfg)
+
+    def _reshape_dequant_rows_to_hidden_major(rows, out_features: int):
+        if rows.ndim == 2 and rows.shape[0] == out_features and rows.shape[1] == hidden:
+            return rows.reshape(hidden, out_features).contiguous()
+        return rows
+
+    if hf_name.endswith(".in_proj_z.weight"):
+        dense = _reshape_dequant_rows_to_hidden_major(dense, value_dim)
+        return apply_gguf_to_hf_weight(dense, hf_name, cfg)
+    if hf_name.endswith((".in_proj_a.weight", ".in_proj_b.weight")):
+        nvh = int(cfg["num_value_heads"])
+        dense = _reshape_dequant_rows_to_hidden_major(dense, nvh)
+        return apply_gguf_to_hf_weight(dense, hf_name, cfg)
     if hf_name.endswith(".in_proj_qkv.weight"):
         key_dim, value_dim, _ = _linear_attn_dims(cfg)
         lead = key_dim * 2 + value_dim

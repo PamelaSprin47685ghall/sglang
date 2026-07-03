@@ -65,8 +65,9 @@ def test_in_proj_z_gguf_slice_dequant_is_out_in_rows():
     cfg = _vcfg()
     hf = "model.layers.0.linear_attn.in_proj_z.weight"
     ref = _layer0_apply_gguf_ref("blk.0.attn_gate.weight", hf, cfg)
+    hidden = 2048
     value_dim = cfg["num_value_heads"] * cfg["head_v_dim"]
-    assert ref.shape == (value_dim, 2048)
+    assert ref.shape == (hidden, value_dim)
 
 
 def test_on_the_fly_skips_out_proj_runtime_perm_path():
@@ -144,7 +145,7 @@ def test_iterator_in_proj_z_matches_apply_gguf_hidden_major():
     )
     w = items[hf.replace("weight", "qweight")].float()
     ref = _layer0_apply_gguf_ref(gt, hf, cfg)
-    assert ref.shape == (4096, 2048)
+    assert ref.shape == (2048, 4096)
     assert w.shape == ref.shape
     assert torch.allclose(w, ref, atol=0.05, rtol=0.02)
 
@@ -161,7 +162,7 @@ def test_iterator_in_proj_a_matches_apply_gguf_out_in_rows():
     )
     w = items[hf.replace("weight", "qweight")].float()
     ref = _layer0_apply_gguf_ref(gt, hf, cfg)
-    assert ref.shape == (32, 2048)
+    assert ref.shape == (2048, 32)
     assert w.shape == ref.shape
     assert torch.allclose(w, ref, atol=0.05, rtol=0.02)
 

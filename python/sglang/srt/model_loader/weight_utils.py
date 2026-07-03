@@ -1060,6 +1060,16 @@ def gguf_quant_weights_iterator(
                 lead = key_dim * 2 + value_dim
                 if param.shape[0] == lead:
                     param = param.t().contiguous()
+            elif name.endswith(
+                (
+                    "linear_attn.in_proj_z.weight",
+                    "linear_attn.in_proj_a.weight",
+                    "linear_attn.in_proj_b.weight",
+                )
+            ) and param.ndim == 2 and param.shape[0] == int(
+                qwen35_linear_attn_vcfg.get("hidden_size", 2048)
+            ):
+                param = param.t().contiguous()
             yield qname, param
             continue
 

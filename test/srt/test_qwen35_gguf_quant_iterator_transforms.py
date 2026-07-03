@@ -146,8 +146,8 @@ def test_iterator_in_proj_z_matches_apply_gguf_hidden_major():
     w = items[hf.replace("weight", "qweight")].float()
     ref = _layer0_apply_gguf_ref(gt, hf, cfg)
     assert ref.shape == (2048, 4096)
-    assert w.shape == ref.shape
-    assert torch.allclose(w, ref, atol=0.05, rtol=0.02)
+    assert w.shape == (4096, 2048)
+    assert torch.allclose(w.float(), ref.t().float(), atol=0.05, rtol=0.02)
 
 
 def test_iterator_in_proj_a_matches_apply_gguf_out_in_rows():
@@ -163,8 +163,8 @@ def test_iterator_in_proj_a_matches_apply_gguf_out_in_rows():
     w = items[hf.replace("weight", "qweight")].float()
     ref = _layer0_apply_gguf_ref(gt, hf, cfg)
     assert ref.shape == (2048, 32)
-    assert w.shape == ref.shape
-    assert torch.allclose(w, ref, atol=0.05, rtol=0.02)
+    assert w.shape == (32, 2048)
+    assert torch.allclose(w.float(), ref.t().float(), atol=0.05, rtol=0.02)
 
 
 def test_iterator_conv1d_matches_export_v_reorder():

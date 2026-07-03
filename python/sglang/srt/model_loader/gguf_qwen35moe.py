@@ -376,6 +376,13 @@ def qwen35_gguf_dequant_apply_for_load(w, hf_name: str, cfg: dict):
 
 
 def qwen35_col_linear_weight_to_loader_layout(hf_name: str, w):
+    if not hf_name.endswith((".mlp.gate.weight", ".mlp.shared_expert.gate.weight")):
+        return w
+    if w.ndim != 2:
+        return w
+    out, inp = int(w.shape[0]), int(w.shape[1])
+    if out > inp:
+        return w.t().contiguous()
     return w
 
 
@@ -459,7 +466,7 @@ def apply_gguf_to_hf_weight(w, hf_name: str, cfg: dict):
     if not _needs_v_head_reorder(hf_name, cfg):
         if hf_name.endswith(".conv1d.weight") and w.ndim == 2:
             return w.unsqueeze(1).contiguous()
-        return w
+        return qwen35_col_linear_weight_to_loader_layout(hf_name, w)
 
     key_dim, value_dim, conv_dim = _linear_attn_dims(cfg)
     vpk, kh, hvd = int(cfg["num_v_per_k"]), int(cfg["k_heads"]), int(cfg["head_v_dim"])
@@ -510,4 +517,4 @@ def apply_gguf_to_hf_weight(w, hf_name: str, cfg: dict):
             )
     if hf_name.endswith(".conv1d.weight") and w.ndim == 2:
         return w.unsqueeze(1).contiguous()
-    return w
+    return qwen35_col_linear_weight_to_loader_layout(hf_name, w)

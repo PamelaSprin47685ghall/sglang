@@ -74,6 +74,24 @@ def should_ignore_layer(
     return should_ignore_layer
 
 
+_VLM_PREFIX_A = "model.language_model."
+_VLM_PREFIX_B = "language_model.model."
+
+
+def _vlm_prefix_equivalent(layer_name: str, target: str) -> bool:
+    if layer_name.startswith(_VLM_PREFIX_A) and target.startswith(_VLM_PREFIX_B):
+        return (
+            layer_name[len(_VLM_PREFIX_A) :]
+            == target[len(_VLM_PREFIX_B) :]
+        )
+    if layer_name.startswith(_VLM_PREFIX_B) and target.startswith(_VLM_PREFIX_A):
+        return (
+            layer_name[len(_VLM_PREFIX_B) :]
+            == target[len(_VLM_PREFIX_A) :]
+        )
+    return False
+
+
 def check_equal_or_regex_match(layer_name: str, targets: Iterable[str]) -> bool:
     """
     Checks whether a layer_name is exactly equal or a regex match for
@@ -81,6 +99,8 @@ def check_equal_or_regex_match(layer_name: str, targets: Iterable[str]) -> bool:
     """
     for target in targets:
         if _is_equal_or_regex_match(layer_name, target, check_contains=True):
+            return True
+        if _vlm_prefix_equivalent(layer_name, target):
             return True
     return False
 

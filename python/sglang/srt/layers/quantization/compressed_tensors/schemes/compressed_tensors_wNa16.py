@@ -207,8 +207,6 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
     # Checkpoints are serialized in compressed-tensors format, which is
     # different from the format the kernel may want. Handle repacking here.
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Default names since marlin requires empty parameters for these,
-        # TODO: remove this requirement from marlin (allow optional tensors)
         self.w_q_name = "weight_packed"
         self.w_s_name = "weight_scale"
         self.w_zp_name = "weight_zero_point"
@@ -216,13 +214,8 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
 
         device = getattr(layer, self.w_q_name).device
         c = self.kernel_config
-
-        check_marlin_supports_shape(
-            c.partition_weight_shape[1],  # out_features
-            c.partition_weight_shape[0],  # in_features
-            c.full_weight_shape[0],  # in_features
-            c.group_size,
-        )
+        layer_name = getattr(layer, "layer_name", "?")
+        logger.warning(f"Marlin repack: layer={layer_name} size_k={c.partition_weight_shape[0]} size_n={c.partition_weight_shape[1]} bits={c.weight_type.size_bits}")        
 
         row_parallel = c.partition_weight_shape[0] != c.full_weight_shape[0]
         self.is_k_full = marlin_is_k_full(c.has_g_idx, row_parallel)

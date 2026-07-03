@@ -105,6 +105,7 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
+from sglang.srt.models.utils import WeightsMapper
 
 # Models
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
@@ -153,6 +154,9 @@ def _linear_param_device(linear: nn.Module) -> torch.device:
     qweight = getattr(linear, "qweight", None)
     if qweight is not None:
         return qweight.device
+    weight_packed = getattr(linear, "weight_packed", None)
+    if weight_packed is not None:
+        return weight_packed.device
     return linear.weight.device
 
 
@@ -192,6 +196,104 @@ def _map_gguf_text_name_to_vl_param(name: str) -> str:
         return name.replace("model.lm_head.", "lm_head.", 1)
     if name == "model.lm_head.weight" or name.startswith("model.lm_head"):
         return name.replace("model.lm_head", "lm_head", 1)
+    return name
+
+
+def _map_hf_flat_text_to_vl_lm_param(name: str) -> str:
+    """Map HF slice keys onto ``Qwen3_5MoeForConditionalGeneration.model.*`` params.
+
+    ``Qwen3_5MoeForConditionalGeneration`` exposes the text stack as ``self.model``
+    with layer prefix ``model.layers`` in ``named_parameters``.  Only
+    ``model.language_model.`` is stripped to ``model.``; ``model.layers.*``,
+    ``model.embed_tokens.*``, ``model.norm.*`` pass through unchanged."""
+    if name.startswith("model.language_model."):
+        return name.replace("model.language_model.", "model.", 1)
+    return name
+
+
+def _stacked_shard_in_name(name: str, weight_name: str) -> bool:
+    """Check whether ``weight_name`` appears as a bounded dotted segment in ``name``.
+
+    Avoids substring false positives such as ``q_proj`` matching ``q_proj_something``.
+    """
+    return f".{weight_name}." in name or name.endswith(f".{weight_name}")
+
+
+def _replace_stacked_shard(name: str, param_name: str, weight_name: str) -> str:
+    """Replace the bounded ``weight_name`` segment in ``name`` with ``param_name``.
+
+    Replaces exactly the dotted segment ``.weight_name.`` or the trailing
+    ``.weight_name`` suffix once, leaving other occurrences of the substring
+    untouched.
+    """
+    if f".{weight_name}." in name:
+        return name.replace(f".{weight_name}.", f".{param_name}.", 1)
+    if name.endswith(f".{weight_name}"):
+        return name[: -len(f".{weight_name}")] + f".{param_name}"
+    return name
+
+
+def _apply_vl_hf_to_sglang_weight_name(name: str, mapper) -> str:
+    if mapper is None:
+        return name
+    mapped = mapper._map_name(name)
+    return mapped if mapped is not None else name
+
+
+def _map_vl_lm_layer_param_to_sglang_attn_submodule(
+    name: str, config, params_dict: dict
+) -> str:
+    """HF checkpoints put norms/MLP under ``layers.N.*``; SGLang nests them under ``layers.N.{linear,}attn.*``."""
+    markers = ("model.layers.", "model.language_model.layers.")
+    for marker in markers:
+        if name.startswith(marker):
+            rest = name[len(marker) :]
+            parts = rest.split(".", 2)
+            if len(parts) < 2:
+                continue
+            try:
+                layer_idx = int(parts[0])
+            except ValueError:
+                continue
+            tail = parts[1] if len(parts) == 2 else f"{parts[1]}.{parts[2]}"
+            layer_type = _qwen35_decoder_layer_type(config, layer_idx)
+            if layer_type == "attention" and tail.startswith("self_attn."):
+                return f"{marker}{layer_idx}.{tail[len('self_attn.') :]}"
+            if tail.startswith(("linear_attn.", "self_attn.", "mlp.")):
+                return name
+            attn_sub = (
+                "self_attn" if layer_type == "attention" else "linear_attn"
+            )
+            candidate = f"{marker}{layer_idx}.{attn_sub}.{tail}"
+            if candidate in params_dict:
+                return candidate
+    return name
+
+
+def _resolve_compressed_tensors_param_name(name: str, params_dict: dict) -> str:
+    if name in params_dict:
+        return name
+    # 保留原有weight_packed->weight的fallback逻辑
+    for suffix in (".weight_packed", ".weight_scale", ".weight_shape"):
+        if name.endswith(suffix):
+            base = name[: -len(suffix)] + ".weight"
+            if base in params_dict:
+                return base
+    # 新增：checkpoint中的.weight映射到模型的compressed-tensors参数
+    if name.endswith(".weight"):
+        base = name[: -len(".weight")]
+        # 优先匹配weight_packed
+        packed_name = base + ".weight_packed"
+        if packed_name in params_dict:
+            return packed_name
+        # 其次匹配weight_scale
+        scale_name = base + ".weight_scale"
+        if scale_name in params_dict:
+            return scale_name
+        # 最后匹配weight_shape
+        shape_name = base + ".weight_shape"
+        if shape_name in params_dict:
+            return shape_name
     return name
 
 
@@ -1210,6 +1312,26 @@ ALL_DECODER_LAYER_TYPES = {
 }
 
 
+def _qwen35_text_config(config):
+    return getattr(config, "text_config", config)
+
+
+def _qwen35_decoder_layer_type(config, layer_idx: int) -> str:
+    """HF ``Qwen3_5MoeTextConfig`` may lack SGLang ``layers_block_type`` property."""
+    cfg = _qwen35_text_config(config)
+    layers_block_type = getattr(cfg, "layers_block_type", None)
+    if layers_block_type is not None and layer_idx < len(layers_block_type):
+        return layers_block_type[layer_idx]
+    layer_types = getattr(cfg, "layer_types", None)
+    if layer_types is not None and layer_idx < len(layer_types):
+        lt = layer_types[layer_idx]
+        return "attention" if lt == "full_attention" else lt
+    interval = getattr(cfg, "full_attention_interval", 4)
+    if (layer_idx + 1) % interval == 0:
+        return "attention"
+    return "linear_attention"
+
+
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
 
@@ -1238,7 +1360,7 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         # Decoder layers
         def get_layer(idx: int, prefix: str):
-            layer_type = config.layers_block_type[idx]
+            layer_type = _qwen35_decoder_layer_type(config, idx)
             layer_class = ALL_DECODER_LAYER_TYPES[layer_type]
             if layer_type == "attention":
                 prefix = add_prefix("self_attn", prefix)
@@ -1448,13 +1570,13 @@ class Qwen3_5ForCausalLM(nn.Module):
             name = _normalize_qwen35_checkpoint_name(name)
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
+                if not _stacked_shard_in_name(name, weight_name):
                     continue
 
                 if "mlp.experts" in name:
                     continue
 
-                name = name.replace(weight_name, param_name)
+                name = _replace_stacked_shard(name, param_name, weight_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -1627,7 +1749,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                     expert_params_mapping = fused_expert_params_mapping
 
                 # Skip non-stacked layers and experts (experts handled below).
-                if weight_name not in name:
+                if not _stacked_shard_in_name(name, weight_name):
                     continue
 
                 # We have mlp.experts[0].gate_proj in the checkpoint.
@@ -1642,7 +1764,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 # not a fused gate_up_proj.
                 if "mlp.experts" in name or "shared_expert" in name:
                     continue
-                name = name.replace(weight_name, param_name)
+                name = _replace_stacked_shard(name, param_name, weight_name)
                 # Skip loading extra parameters for GPTQ/modelopt models.
                 if name.endswith(ignore_suffixes) and name not in params_dict:
                     continue
@@ -1660,12 +1782,12 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in name:
+                    if not _stacked_shard_in_name(name, weight_name):
                         continue
                     # Anyway, this is an expert weight and should not be
                     # attempted to load as other weights later
                     is_expert_weight = True
-                    name_mapped = name.replace(weight_name, param_name)
+                    name_mapped = _replace_stacked_shard(name, param_name, weight_name)
                     if is_fused_expert:
                         if "experts.gate_up_proj" in name:
                             loaded_weight = loaded_weight.chunk(2, dim=-2)
@@ -1800,18 +1922,19 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             # format (model.layers.*, model.embed_tokens.*, lm_head.*).
             # HF safetensors names with "language_model" pass through unchanged.
             name = _checkpoint_name_to_model_param(name)
-            if ".self_attn." in name:
-                name = name.replace(".self_attn", "")
-
+            name = _map_hf_flat_text_to_vl_lm_param(name)
+            name = _map_vl_lm_layer_param_to_sglang_attn_submodule(
+                name, self.config, params_dict
+            )
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
+                if not _stacked_shard_in_name(name, weight_name):
                     continue
 
                 if "visual" in name or "mlp.experts" in name:
                     continue
 
-                name = name.replace(weight_name, param_name)
+                name = _replace_stacked_shard(name, param_name, weight_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -1849,6 +1972,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
 class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     """Qwen3.5 MoE Vision-Language Model."""
+
+    # Qwen3.5 MoE LM uses ``model.language_model.*`` params; parent mapper targets Qwen3LLM ``language_model.model.*``.
+    hf_to_sglang_mapper = WeightsMapper()
 
     def __init__(
         self,
@@ -1962,8 +2088,10 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             # format (model.layers.*, model.embed_tokens.*, lm_head.*).
             # HF safetensors names with "language_model" pass through unchanged.
             name = _checkpoint_name_to_model_param(name)
-            if ".self_attn." in name:
-                name = name.replace(".self_attn", "")
+            name = _map_hf_flat_text_to_vl_lm_param(name)
+            name = _map_vl_lm_layer_param_to_sglang_attn_submodule(
+                name, self.config, params_dict
+            )
             if _try_load_gguf_vocab_qweight(
                 name, loaded_weight, self, loaded_params, params_dict
             ):
@@ -1984,7 +2112,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     expert_params_mapping = fused_expert_params_mapping
 
                 # Skip non-stacked layers and experts (experts handled below).
-                if weight_name not in name:
+                if not _stacked_shard_in_name(name, weight_name):
                     continue
                 if "visual" in name:
                     continue
@@ -2001,7 +2129,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 # not a fused gate_up_proj.
                 if "mlp.experts" in name or "shared_expert" in name:
                     continue
-                name = name.replace(weight_name, param_name)
+                name = _replace_stacked_shard(name, param_name, weight_name)
                 # Skip loading extra parameters for GPTQ/modelopt models.
                 if name.endswith(ignore_suffixes) and name not in params_dict:
                     continue
@@ -2019,14 +2147,14 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in name:
+                    if not _stacked_shard_in_name(name, weight_name):
                         continue
                     if "visual" in name or self.config.encoder_only:
                         continue
                     # Anyway, this is an expert weight and should not be
                     # attempted to load as other weights later
                     is_expert_weight = True
-                    name_mapped = name.replace(weight_name, param_name)
+                    name_mapped = _replace_stacked_shard(name, param_name, weight_name)
                     if is_fused_expert:
                         if "experts.gate_up_proj" in name:
                             loaded_weight = loaded_weight.chunk(2, dim=-2)
@@ -2202,8 +2330,25 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                             loaded_params.add(name)
                             continue
 
+                    if _try_load_shared_expert_gguf_shard(
+                        name, loaded_weight, params_dict, loaded_params
+                    ):
+                        continue
+
+                    name = _resolve_compressed_tensors_param_name(name, params_dict)
                     if name in params_dict.keys():
                         param = params_dict[name]
+                        if (
+                            loaded_weight.shape != param.data.shape
+                            and loaded_weight.dim() == param.data.dim()
+                        ):
+                            logger.warning(
+                                "Skip mismatched %s ckpt=%s param=%s",
+                                name,
+                                tuple(loaded_weight.shape),
+                                tuple(param.data.shape),
+                            )
+                            continue
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )

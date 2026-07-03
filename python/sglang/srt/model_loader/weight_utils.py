@@ -1048,7 +1048,18 @@ def gguf_quant_weights_iterator(
             else:
                 yield qname.replace("qweight", "qweight_type"), type_tensor
             if name.endswith("linear_attn.in_proj_qkv.weight") and param.ndim == 2:
-                param = param.t().contiguous()
+                key_dim = (
+                    int(qwen35_linear_attn_vcfg["k_heads"])
+                    * int(qwen35_linear_attn_vcfg["head_k_dim"])
+                )
+                value_dim = (
+                    int(qwen35_linear_attn_vcfg["num_v_per_k"])
+                    * int(qwen35_linear_attn_vcfg["k_heads"])
+                    * int(qwen35_linear_attn_vcfg["head_v_dim"])
+                )
+                lead = key_dim * 2 + value_dim
+                if param.shape[0] == lead:
+                    param = param.t().contiguous()
             yield qname, param
             continue
 

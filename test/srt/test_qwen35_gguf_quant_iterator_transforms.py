@@ -37,13 +37,14 @@ def test_dequant_apply_matches_dim1_export_on_loader_layout_in_proj_qkv():
     cfg = _vcfg()
     key_dim = cfg["k_heads"] * cfg["head_k_dim"]
     value_dim = cfg["num_value_heads"] * cfg["head_v_dim"]
-    out_ch, lead = 64, key_dim * 2 + value_dim
-    loader_layout = torch.randn(lead, out_ch)
+    hidden, lead = 2048, key_dim * 2 + value_dim
     hf = "model.layers.0.linear_attn.in_proj_qkv.weight"
-    ref = apply_gguf_to_hf_weight(loader_layout.t().clone(), hf, cfg).t().contiguous()
-    got = qwen35_gguf_dequant_apply_for_load(loader_layout.clone(), hf, cfg)
-    assert torch.allclose(got, ref)
-    assert got.shape[0] == lead
+    logical = torch.randn(hidden, lead)
+    dequant_rows = logical.reshape(-1).reshape(lead, hidden).contiguous()
+    ref = apply_gguf_to_hf_weight(logical.clone(), hf, cfg)
+    got = qwen35_gguf_dequant_apply_for_load(dequant_rows.clone(), hf, cfg)
+    assert torch.allclose(got, ref, atol=1e-5, rtol=1e-5)
+    assert got.shape == (hidden, lead)
 
 
 def _layer0_apply_gguf_ref(gt: str, hf: str, cfg):
@@ -101,7 +102,34 @@ def test_iterator_yields_bf16_in_proj_qkv_for_layer0_slice():
         np.array(gguf.dequantize(np.array(t.data), t.tensor_type))
     ).float()
     ref = qwen35_gguf_dequant_apply_for_load(ref_dense, hf, cfg)
-    assert torch.allclose(w.float(), ref.t(), atol=1e-2, rtol=1e-2)
+    assert ref.shape == (2048, 8192)
+    assert torch.allclose(w.float(), ref.float(), atol=1e-2, rtol=1e-2)
+
+
+def test_in_proj_qkv_iterator_matches_export_safetensors():
+    from safetensors import safe_open
+
+    path = "/home/kunweiz/Desktop/Ornith/ornith-gguf-runtime/ornith-gpu-non-expert.gguf"
+    exp_path = (
+        "/home/kunweiz/Desktop/Ornith/ornith-gpu-bf16-from-gguf/model-gpu-from-gguf.safetensors"
+    )
+    gt = "blk.0.attn_qkv.weight"
+    hf = "model.layers.0.linear_attn.in_proj_qkv.weight"
+    cfg = _vcfg()
+    items = dict(
+        gguf_quant_weights_iterator(
+            path,
+            {gt: hf},
+            qwen35_linear_attn_vcfg=cfg,
+            qwen35_dense_storage_dtype=torch.bfloat16,
+        )
+    )
+    w = items[hf.replace("weight", "qweight")].float()
+    exp_key = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight"
+    with safe_open(exp_path, framework="pt") as f:
+        exp = f.get_tensor(exp_key).float()
+    assert w.shape == exp.shape == (2048, 8192)
+    assert torch.allclose(w, exp, atol=0.01, rtol=0.01)
 
 
 def test_iterator_in_proj_z_matches_apply_gguf_hidden_major():

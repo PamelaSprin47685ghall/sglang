@@ -358,6 +358,13 @@ def qwen35_gguf_dequant_apply_for_load(w, hf_name: str, cfg: dict):
         )
     ):
         return qwen35_gguf_dense_for_gguf_linear(dense, hf_name, cfg)
+    if hf_name.endswith(".in_proj_qkv.weight"):
+        key_dim, value_dim, _ = _linear_attn_dims(cfg)
+        lead = key_dim * 2 + value_dim
+        hidden = _qwen35_hidden_size(cfg)
+        if dense.ndim == 2 and dense.shape[0] == lead and dense.shape[1] == hidden:
+            dense = dense.reshape(hidden, lead).contiguous()
+        return apply_gguf_to_hf_weight(dense, hf_name, cfg)
     return _qwen35_on_the_fly_linear_attn_qweight(dense, hf_name, cfg)
 
 

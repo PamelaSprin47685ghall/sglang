@@ -3,6 +3,7 @@
 import gguf
 import numpy as np
 import torch
+from safetensors import safe_open
 
 from sglang.srt.model_loader.gguf_qwen35moe import (
     apply_gguf_to_hf_weight,
@@ -75,6 +76,24 @@ def test_on_the_fly_skips_out_proj_runtime_perm_path():
     assert not qwen35moe_gguf_on_the_fly_needs_hf_transform(
         "model.layers.0.linear_attn.out_proj.weight", cfg
     )
+
+
+def test_out_proj_q6k_dequant_meta_layout_matches_export():
+    import gguf as gguf_mod
+    from sglang.srt.model_loader.gguf_qwen35moe import qwen35_gguf_dequant_from_reader_tensor
+
+    path = "/home/kunweiz/Desktop/Ornith/ornith-gguf-runtime/ornith-gpu-non-expert.gguf"
+    t = next(x for x in gguf_mod.GGUFReader(path).tensors if x.name == "blk.0.ssm_out.weight")
+    dense = qwen35_gguf_dequant_from_reader_tensor(t)
+    w = dense.reshape(tuple(int(x) for x in t.shape)).float()
+    exp_key = "model.language_model.layers.0.linear_attn.out_proj.weight"
+    with safe_open(
+        "/home/kunweiz/Desktop/Ornith/ornith-gpu-bf16-from-gguf/model-gpu-from-gguf.safetensors",
+        framework="pt",
+    ) as f:
+        ref = f.get_tensor(exp_key).float()
+    assert w.shape == ref.shape
+    assert torch.allclose(w, ref, atol=0.05, rtol=0.02)
 
 
 def test_iterator_yields_bf16_in_proj_qkv_for_layer0_slice():

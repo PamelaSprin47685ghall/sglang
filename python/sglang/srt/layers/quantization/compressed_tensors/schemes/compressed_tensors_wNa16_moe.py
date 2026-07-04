@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import os
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -98,9 +99,10 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         extra_weight_attrs.update(
             {"is_transposed": True, "quant_method": self.strategy}
         )
+        allocate_experts = 0 if os.environ.get("SGLANG_KT_BYPASS_GPU_MOE") == "1" else num_experts
         w13_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts,
+                allocate_experts,
                 hidden_size // self.packed_factor,
                 2 * intermediate_size_per_partition,
                 dtype=torch.int32,
@@ -112,7 +114,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
 
         w2_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts,
+                allocate_experts,
                 intermediate_size_per_partition // self.packed_factor,
                 hidden_size,
                 dtype=torch.int32,
@@ -142,7 +144,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
 
         w13_scale = torch.nn.Parameter(
             torch.ones(
-                num_experts,
+                allocate_experts,
                 num_groups_w13,
                 2 * intermediate_size_per_partition,
                 dtype=params_dtype,
@@ -153,7 +155,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         set_weight_attrs(w13_scale, extra_weight_attrs)
 
         w2_scale = torch.nn.Parameter(
-            torch.ones(num_experts, num_groups_w2, hidden_size, dtype=params_dtype),
+            torch.ones(allocate_experts, num_groups_w2, hidden_size, dtype=params_dtype),
             requires_grad=False,
         )
         layer.register_parameter("w2_weight_scale", w2_scale)
@@ -174,7 +176,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
 
         w13_g_idx = torch.nn.Parameter(
             torch.empty(
-                num_experts,
+                allocate_experts,
                 hidden_size,
                 dtype=torch.int32,
             ),
@@ -185,7 +187,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
 
         w2_g_idx = torch.nn.Parameter(
             torch.empty(
-                num_experts,
+                allocate_experts,
                 intermediate_size_per_partition,
                 dtype=torch.int32,
             ),
@@ -196,7 +198,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
 
         w13_g_idx_sort_indices = torch.nn.Parameter(
             torch.empty(
-                num_experts,
+                allocate_experts,
                 hidden_size,
                 dtype=torch.int32,
             ),
@@ -207,7 +209,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
 
         w2_g_idx_sort_indices = torch.nn.Parameter(
             torch.empty(
-                num_experts,
+                allocate_experts,
                 intermediate_size_per_partition,
                 dtype=torch.int32,
             ),

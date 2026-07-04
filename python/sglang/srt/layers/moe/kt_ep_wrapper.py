@@ -2102,7 +2102,6 @@ def create_kt_config_from_server_args(
     )
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
 def mask_and_remap_expert_ids(
     topk_ids: torch.Tensor,
     gpu_experts_mask: torch.Tensor,
@@ -3106,7 +3105,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             _cls._kt_layer_step[_li] = _cls._kt_layer_step.get(_li, 0) + 1
             _step = _cls._kt_layer_step[_li]
             if _step <= 16 or _step % 16 == 0:
-                logger.debug(
+                logger.warning(
                     "[kt-time] layer=%s step=%d total=%.2fms submit=%.2f "
                     "mask=%.2f gpu=%.2f sync=%.2f merge=%.2f "
                     "cpu_wait=%.2fms num_tokens=%d",

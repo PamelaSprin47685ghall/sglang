@@ -247,10 +247,14 @@ _ON_THE_FLY_DEQUANT_SUFFIXES = (
     ".in_proj_z.weight",
     ".in_proj_a.weight",
     ".in_proj_b.weight",
+    ".embed_tokens.weight",
+    ".lm_head.weight",
 )
 
 
 def qwen35moe_gguf_on_the_fly_needs_hf_transform(hf_name: str, cfg: dict) -> bool:
+    if any(hf_name.endswith(s) for s in (".embed_tokens.weight", ".lm_head.weight")):
+        return True
     if not _needs_v_head_reorder(hf_name, cfg):
         return False
     return any(hf_name.endswith(s) for s in _ON_THE_FLY_DEQUANT_SUFFIXES)
@@ -283,6 +287,9 @@ def _qwen35_dequant_to_out_in_rows(w, hf_name: str, cfg: dict):
         if w.shape[0] == hidden:
             return w
         if w.shape[1] == hidden:
+            return w.t().contiguous()
+    if hf_name.endswith((".embed_tokens.weight", ".lm_head.weight")):
+        if w.shape[0] == hidden:
             return w.t().contiguous()
     return w
 
@@ -355,7 +362,7 @@ def qwen35_gguf_dequant_apply_for_load(w, hf_name: str, cfg: dict):
 
     def _reshape_dequant_rows_to_hidden_major(rows, out_features: int):
         if rows.ndim == 2 and rows.shape[0] == out_features and rows.shape[1] == hidden:
-            return rows.reshape(hidden, out_features).contiguous()
+            return rows.t().contiguous()
         return rows
 
     if hf_name.endswith(".in_proj_z.weight"):
@@ -370,7 +377,7 @@ def qwen35_gguf_dequant_apply_for_load(w, hf_name: str, cfg: dict):
         lead = key_dim * 2 + value_dim
         hidden = _qwen35_hidden_size(cfg)
         if dense.ndim == 2 and dense.shape[0] == lead and dense.shape[1] == hidden:
-            dense = dense.reshape(hidden, lead).contiguous()
+            dense = dense.t().contiguous()
         return apply_gguf_to_hf_weight(dense, hf_name, cfg)
     return _qwen35_on_the_fly_linear_attn_qweight(dense, hf_name, cfg)
 
@@ -480,14 +487,23 @@ def apply_gguf_to_hf_weight(w, hf_name: str, cfg: dict):
         if w.ndim == 2 and w.shape[1] == lead:
             return _v_reorder_dim1_segment(w, key_dim, value_dim, vpk, kh, hvd)
     if hf_name.endswith(".in_proj_z.weight") and w.ndim >= 1:
+        if w.ndim == 2 and w.shape[0] == value_dim:
+            return w.reshape(vpk, kh, hvd, w.shape[1]).permute(1, 0, 2, 3).reshape(w.shape)
+        if w.ndim == 2 and w.shape[1] == value_dim:
+            return w.reshape(w.shape[0], vpk, kh, hvd).permute(0, 2, 1, 3).reshape(w.shape)
         flat = w.reshape(-1)
         if flat.numel() == value_dim:
             return v_head_tiled_to_grouped(
                 flat.reshape(vpk, kh, hvd), vpk, kh, hvd
             ).reshape(w.shape)
     if hf_name.endswith((".in_proj_a.weight", ".in_proj_b.weight")):
+        lead = kh * vpk
+        if w.ndim == 2 and w.shape[0] == lead:
+            return w.reshape(vpk, kh, 1, w.shape[1]).permute(1, 0, 2, 3).reshape(w.shape)
+        if w.ndim == 2 and w.shape[1] == lead:
+            return w.reshape(w.shape[0], vpk, kh, 1).permute(0, 2, 1, 3).reshape(w.shape)
         flat = w.reshape(-1)
-        if flat.numel() == kh * vpk:
+        if flat.numel() == lead:
             return (
                 v_head_tiled_to_grouped(flat.reshape(vpk, kh, 1), vpk, kh, 1)
                 .reshape(w.shape)

@@ -93,7 +93,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.gguf_qwen35moe import (
@@ -124,16 +125,19 @@ def _is_mtp_or_nextn_weight(name: str) -> bool:
 
 
 def _is_gguf_flat_text_checkpoint_name(name: str) -> bool:
-    if name.startswith("model.layers."):
+    if "language_model" in name or "visual" in name:
+        return False
+    if "layers." in name:
         return True
-    if name.startswith("model.embed_tokens") or name.startswith("model.norm"):
+    if "embed_tokens" in name or "model.norm" in name:
         return True
-    if name.startswith("model.lm_head") or name.startswith("lm_head."):
+    if "model.lm_head" in name or "lm_head." in name:
         return True
     return False
 
 
 def _checkpoint_name_to_model_param(name: str) -> str:
+    name = name.replace("model.language_model.", "model.")
     if "language_model" in name or name.startswith("visual.") or name.startswith(
         "model.visual."
     ):
@@ -161,25 +165,16 @@ def _linear_param_device(linear: nn.Module) -> torch.device:
 
 
 def _enable_gguf_linear_attn_out_proj_perms(root: nn.Module) -> None:
-    layer_lists = []
-    if hasattr(root, "layers"):
-        layer_lists.append(root.layers)
-    inner = getattr(root, "model", None)
-    if inner is not None:
-        if hasattr(inner, "layers"):
-            layer_lists.append(inner.layers)
-        lm = getattr(inner, "language_model", None)
-        if lm is not None and hasattr(lm, "layers"):
-            layer_lists.append(lm.layers)
+    params_dict = dict(root.named_parameters(remove_duplicate=False))
+    if not any(k.endswith(".out_proj.qweight") for k in params_dict):
+        return
     seen: Set[int] = set()
-    for layers in layer_lists:
-        for layer in layers:
-            if id(layer) in seen:
-                continue
-            seen.add(id(layer))
-            la = getattr(layer, "linear_attn", None)
-            if la is not None and hasattr(la, "enable_gguf_out_proj_activation_perm"):
-                la.enable_gguf_out_proj_activation_perm()
+    for m in root.modules():
+        if id(m) in seen:
+            continue
+        seen.add(id(m))
+        if hasattr(m, "enable_gguf_out_proj_activation_perm"):
+            m.enable_gguf_out_proj_activation_perm()
 
 
 def _map_gguf_text_name_to_vl_param(name: str) -> str:
@@ -240,6 +235,38 @@ def _apply_vl_hf_to_sglang_weight_name(name: str, mapper) -> str:
     return mapped if mapped is not None else name
 
 
+def _align_text_stack_prefix_to_runtime(name: str, params_dict: dict) -> str:
+    """Map flat HF ``model.layers.*`` checkpoint keys onto VL runtime ``named_parameters`` keys."""
+    # Check if it's directly in params_dict
+    if name in params_dict:
+        return name
+
+    # Now perform prefix mapping
+    for flat, runtime in (
+        ("model.embed_tokens.", "model.language_model.embed_tokens."),
+        ("model.norm.", "model.language_model.norm."),
+    ):
+        if name.startswith(flat):
+            candidate = name.replace(flat, runtime, 1)
+            if candidate in params_dict:
+                return candidate
+
+    if name.startswith("model.layers."):
+        rest = name[len("model.layers.") :]
+        for runtime_prefix in (
+            "model.language_model.layers.",
+            "language_model.model.layers.",
+        ):
+            candidate = runtime_prefix + rest
+            if candidate in params_dict:
+                return candidate
+        suffix = f"layers.{rest}"
+        hits = [k for k in params_dict if k.endswith(suffix)]
+        if len(hits) == 1:
+            return hits[0]
+    return name
+
+
 def _map_vl_lm_layer_param_to_sglang_attn_submodule(
     name: str, config, params_dict: dict
 ) -> str:
@@ -258,16 +285,29 @@ def _map_vl_lm_layer_param_to_sglang_attn_submodule(
             tail = parts[1] if len(parts) == 2 else f"{parts[1]}.{parts[2]}"
             layer_type = _qwen35_decoder_layer_type(config, layer_idx)
             if layer_type == "attention" and tail.startswith("self_attn."):
-                return f"{marker}{layer_idx}.{tail[len('self_attn.') :]}"
+                if any(f"layers.{layer_idx}.self_attn." in k for k in params_dict):
+                    return _align_text_stack_prefix_to_runtime(name, params_dict)
+                return _align_text_stack_prefix_to_runtime(f"{marker}{layer_idx}.{tail[len('self_attn.') :]}", params_dict)
             if tail.startswith(("linear_attn.", "self_attn.", "mlp.")):
-                return name
+                if tail.startswith("linear_attn.A_log"):
+                    candidate = name.replace("linear_attn.A_log", "linear_attn.attn.A_log")
+                    if _align_text_stack_prefix_to_runtime(candidate, params_dict) in params_dict:
+                        name = candidate
+                elif tail.startswith("linear_attn.dt_bias"):
+                    candidate = name.replace("linear_attn.dt_bias", "linear_attn.attn.dt_bias")
+                    if _align_text_stack_prefix_to_runtime(candidate, params_dict) in params_dict:
+                        name = candidate
+                return _align_text_stack_prefix_to_runtime(name, params_dict)
             attn_sub = (
                 "self_attn" if layer_type == "attention" else "linear_attn"
             )
             candidate = f"{marker}{layer_idx}.{attn_sub}.{tail}"
             if candidate in params_dict:
                 return candidate
-    return name
+            aligned_candidate = _align_text_stack_prefix_to_runtime(candidate, params_dict)
+            if aligned_candidate in params_dict:
+                return aligned_candidate
+    return _align_text_stack_prefix_to_runtime(name, params_dict)
 
 
 def _resolve_compressed_tensors_param_name(name: str, params_dict: dict) -> str:
@@ -698,7 +738,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         perm = get_out_proj_activation_perm(
             v_per_k, self.num_k_heads, self.head_v_dim
         )
-        self._gguf_out_proj_act_perm = perm.to(
+        perm_inv = torch.argsort(perm)
+        self._gguf_out_proj_act_perm = perm_inv.to(
             device=_linear_param_device(self.out_proj), dtype=torch.long
         )
 
@@ -781,6 +822,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
+        if self.layer_id == 0:
+            print(f"--- layer 0 GatedDeltaNet.forward ---", flush=True)
+            print(f"  positions shape: {forward_batch.mrope_positions.shape if forward_batch.mrope_positions is not None else None}", flush=True)
+            if forward_batch.mrope_positions is not None:
+                print(f"  positions sample: {forward_batch.mrope_positions[:, :5].tolist()}", flush=True)
+            print(f"  hidden_states min={hidden_states.min().item()} max={hidden_states.max().item()} finite={torch.isfinite(hidden_states).all().item()}", flush=True)
+
+
+
         seq_len, _ = hidden_states.shape
 
         mixed_qkv, _ = self.in_proj_qkv(hidden_states)
@@ -817,6 +867,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 self._kt_lora_scale,
             )
 
+        # Slice back to self.num_v_heads in case Marlin padded the output dimension (N < 64)
+        a = a[:, :self.num_v_heads]
+        b = b[:, :self.num_v_heads]
+
+        if self.layer_id == 0:
+            print(f"  mixed_qkv min={mixed_qkv.min().item()} max={mixed_qkv.max().item()} finite={torch.isfinite(mixed_qkv).all().item()}", flush=True)
+            print(f"  z min={z.min().item()} max={z.max().item()} finite={torch.isfinite(z).all().item()}", flush=True)
+            print(f"  b min={b.min().item()} max={b.max().item()} finite={torch.isfinite(b).all().item()}", flush=True)
+            print(f"  a min={a.min().item()} max={a.max().item()} finite={torch.isfinite(a).all().item()}", flush=True)
+
         b = b.contiguous()
         a = a.contiguous()
 
@@ -826,6 +886,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             a=a,
             b=b,
         )
+
+        if self.layer_id == 0:
+            print(f"  core_attn_out min={core_attn_out.min().item()} max={core_attn_out.max().item()} finite={torch.isfinite(core_attn_out).all().item()}", flush=True)
 
         z_shape_og = z.shape
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
@@ -842,6 +905,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 self._kt_lora_out_proj[1],
                 self._kt_lora_scale,
             )
+
+        if self.layer_id == 0:
+            print(f"  output min={output.min().item()} max={output.max().item()} finite={torch.isfinite(output).all().item()}", flush=True)
+
         return output
 
 
@@ -1601,6 +1668,30 @@ class Qwen3_5ForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
+        # --- diagnostic: print unloaded params ---
+        all_param_names = set(params_dict.keys())
+        unloaded = all_param_names - loaded_params
+        if unloaded:
+            logger.warning("=== UNLOADED PARAMS (%d / %d) ===", len(unloaded), len(all_param_names))
+            for u in sorted(unloaded)[:80]:
+                p = params_dict[u]
+                try:
+                    p_shape = tuple(p.shape)
+                    p_dtype = p.dtype
+                    p_allzero = bool((p.data == 0).all()) if p.numel() > 0 else "empty"
+                except RuntimeError:
+                    p_shape = "uninitialized"
+                    p_dtype = "uninitialized"
+                    p_allzero = "uninitialized"
+                logger.warning("  UNLOADED: %s  shape=%s dtype=%s allzero=%s",
+                               u, p_shape, p_dtype, p_allzero)
+            if len(unloaded) > 80:
+                logger.warning("  ... and %d more", len(unloaded) - 80)
+        else:
+            logger.warning("=== ALL %d PARAMS LOADED ===", len(all_param_names))
+        logger.warning("=== loaded_params count: %d ===", len(loaded_params))
+        # --- end diagnostic ---
+
         return loaded_params
 
 
@@ -1613,6 +1704,8 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
+        if hasattr(config, "text_config"):
+            config = config.text_config
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
@@ -1679,8 +1772,11 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        saw_gguf_checkpoint = False
 
         for name, loaded_weight in weights:
+            if _is_gguf_flat_text_checkpoint_name(name) or ".qweight" in name:
+                saw_gguf_checkpoint = True
             if "rotary_emb.inv_freq" in name:
                 continue
             if _is_mtp_or_nextn_weight(name):
@@ -1689,6 +1785,11 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 )
                 continue
             name = _normalize_qwen35_checkpoint_name(name)
+            name = _map_vl_lm_layer_param_to_sglang_attn_submodule(
+                name, self.config, params_dict
+            )
+            name = _align_text_stack_prefix_to_runtime(name, params_dict)
+            name = _resolve_compressed_tensors_param_name(name, params_dict)
             if _try_load_gguf_vocab_qweight(
                 name, loaded_weight, self, loaded_params, params_dict
             ):
@@ -1762,9 +1863,13 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 # to gate_up_proj — shared_expert is a single Module
                 # with separate gate_proj/down_proj/up_proj attributes,
                 # not a fused gate_up_proj.
-                if "mlp.experts" in name or "shared_expert" in name:
+                if "mlp.experts" in name:
                     continue
                 name = _replace_stacked_shard(name, param_name, weight_name)
+                name = _align_text_stack_prefix_to_runtime(name, params_dict)
+                name = _resolve_compressed_tensors_param_name(name, params_dict)
+                if "qkv_proj" in name:
+                    logger.warning(f"DEBUG: matched qkv_proj, name={name}, shard_id={shard_id}")
                 # Skip loading extra parameters for GPTQ/modelopt models.
                 if name.endswith(ignore_suffixes) and name not in params_dict:
                     continue
@@ -1775,6 +1880,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(name)
                 break
             else:
                 # Track if this is an expert weight to enable early skipping
@@ -1788,6 +1894,8 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                     # attempted to load as other weights later
                     is_expert_weight = True
                     name_mapped = _replace_stacked_shard(name, param_name, weight_name)
+                    name_mapped = _align_text_stack_prefix_to_runtime(name_mapped, params_dict)
+                    name_mapped = _resolve_compressed_tensors_param_name(name_mapped, params_dict)
                     if is_fused_expert:
                         if "experts.gate_up_proj" in name:
                             loaded_weight = loaded_weight.chunk(2, dim=-2)
@@ -1832,6 +1940,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                             shard_id=shard_id,
                             expert_id=expert_id,
                         )
+                    loaded_params.add(name_mapped)
                     name = name_mapped
                     break
                 else:
@@ -1855,6 +1964,30 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
         if saw_gguf_checkpoint:
             _enable_gguf_linear_attn_out_proj_perms(self)
+        # --- diagnostic: print unloaded params ---
+        all_param_names = set(params_dict.keys())
+        unloaded = all_param_names - loaded_params
+        if unloaded:
+            logger.warning("=== UNLOADED PARAMS (%d / %d) ===", len(unloaded), len(all_param_names))
+            for u in sorted(unloaded)[:80]:
+                p = params_dict[u]
+                try:
+                    p_shape = tuple(p.shape)
+                    p_dtype = p.dtype
+                    p_allzero = bool((p.data == 0).all()) if p.numel() > 0 else "empty"
+                except RuntimeError:
+                    p_shape = "uninitialized"
+                    p_dtype = "uninitialized"
+                    p_allzero = "uninitialized"
+                logger.warning("  UNLOADED: %s  shape=%s dtype=%s allzero=%s",
+                               u, p_shape, p_dtype, p_allzero)
+            if len(unloaded) > 80:
+                logger.warning("  ... and %d more", len(unloaded) - 80)
+        else:
+            logger.warning("=== ALL %d PARAMS LOADED ===", len(all_param_names))
+        logger.warning("=== loaded_params count: %d ===", len(loaded_params))
+        # --- end diagnostic ---
+
         return loaded_params
 
 
@@ -1868,9 +2001,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
     ):
         super().__init__(config, quant_config, prefix, language_model_cls)
 
-        rope_config = getattr(self.config, "rope_parameters", None) or getattr(
-            self.config, "rope_scaling", {}
+        cfg = getattr(self.config, "text_config", self.config)
+        rope_config = getattr(cfg, "rope_parameters", None) or getattr(
+            cfg, "rope_scaling", {}
         )
+        if rope_config is None:
+            rope_config = {}
         self.is_mrope_enabled = "mrope_section" in rope_config
 
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
@@ -1926,6 +2062,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             name = _map_vl_lm_layer_param_to_sglang_attn_submodule(
                 name, self.config, params_dict
             )
+            name = _align_text_stack_prefix_to_runtime(name, params_dict)
+            name = _resolve_compressed_tensors_param_name(name, params_dict)
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if not _stacked_shard_in_name(name, weight_name):
@@ -1967,6 +2105,30 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             loaded_params.add(name)
         if saw_gguf_checkpoint:
             _enable_gguf_linear_attn_out_proj_perms(self)
+        # --- diagnostic: print unloaded params ---
+        all_param_names = set(params_dict.keys())
+        unloaded = all_param_names - loaded_params
+        if unloaded:
+            logger.warning("=== UNLOADED PARAMS (%d / %d) ===", len(unloaded), len(all_param_names))
+            for u in sorted(unloaded)[:80]:
+                p = params_dict[u]
+                try:
+                    p_shape = tuple(p.shape)
+                    p_dtype = p.dtype
+                    p_allzero = bool((p.data == 0).all()) if p.numel() > 0 else "empty"
+                except RuntimeError:
+                    p_shape = "uninitialized"
+                    p_dtype = "uninitialized"
+                    p_allzero = "uninitialized"
+                logger.warning("  UNLOADED: %s  shape=%s dtype=%s allzero=%s",
+                               u, p_shape, p_dtype, p_allzero)
+            if len(unloaded) > 80:
+                logger.warning("  ... and %d more", len(unloaded) - 80)
+        else:
+            logger.warning("=== ALL %d PARAMS LOADED ===", len(all_param_names))
+        logger.warning("=== loaded_params count: %d ===", len(loaded_params))
+        # --- end diagnostic ---
+
         return loaded_params
 
 
@@ -1984,9 +2146,12 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         language_model_cls=Qwen3_5MoeForCausalLM,
     ) -> None:
         super().__init__(config, quant_config, prefix, language_model_cls)
-        rope_config = getattr(self.config, "rope_parameters", None) or getattr(
-            self.config, "rope_scaling", {}
+        cfg = getattr(self.config, "text_config", self.config)
+        rope_config = getattr(cfg, "rope_parameters", None) or getattr(
+            cfg, "rope_scaling", {}
         )
+        if rope_config is None:
+            rope_config = {}
         self.is_mrope_enabled = "mrope_section" in rope_config
 
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
@@ -2092,6 +2257,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             name = _map_vl_lm_layer_param_to_sglang_attn_submodule(
                 name, self.config, params_dict
             )
+            name = _align_text_stack_prefix_to_runtime(name, params_dict)
+            name = _resolve_compressed_tensors_param_name(name, params_dict)
             if _try_load_gguf_vocab_qweight(
                 name, loaded_weight, self, loaded_params, params_dict
             ):
@@ -2127,7 +2294,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 # to gate_up_proj — shared_expert is a single Module
                 # with separate gate_proj/down_proj/up_proj attributes,
                 # not a fused gate_up_proj.
-                if "mlp.experts" in name or "shared_expert" in name:
+                if "mlp.experts" in name:
                     continue
                 name = _replace_stacked_shard(name, param_name, weight_name)
                 # Skip loading extra parameters for GPTQ/modelopt models.
@@ -2140,6 +2307,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(name)
                 break
             else:
                 # Track if this is an expert weight to enable early skipping
@@ -2199,6 +2367,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                             shard_id=shard_id,
                             expert_id=expert_id,
                         )
+                    loaded_params.add(name_mapped)
                     name = name_mapped
                     break
                 else:
@@ -2342,13 +2511,21 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                             loaded_weight.shape != param.data.shape
                             and loaded_weight.dim() == param.data.dim()
                         ):
-                            logger.warning(
-                                "Skip mismatched %s ckpt=%s param=%s",
-                                name,
-                                tuple(loaded_weight.shape),
-                                tuple(param.data.shape),
-                            )
-                            continue
+                            if (
+                                loaded_weight.dim() == 2
+                                and loaded_weight.shape[0] == param.data.shape[1]
+                                and loaded_weight.shape[1] == param.data.shape[0]
+                            ):
+                                logger.info(f"Automatically transposing {name} from {loaded_weight.shape} to {param.data.shape}")
+                                loaded_weight = loaded_weight.t().contiguous()
+                            else:
+                                logger.warning(
+                                    "Skip mismatched %s ckpt=%s param=%s",
+                                    name,
+                                    tuple(loaded_weight.shape),
+                                    tuple(param.data.shape),
+                                )
+                                continue
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
@@ -2359,6 +2536,30 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         if saw_gguf_checkpoint:
             _enable_gguf_linear_attn_out_proj_perms(self)
+        # --- diagnostic: print unloaded params ---
+        all_param_names = set(params_dict.keys())
+        unloaded = all_param_names - loaded_params
+        if unloaded:
+            logger.warning("=== UNLOADED PARAMS (%d / %d) ===", len(unloaded), len(all_param_names))
+            for u in sorted(unloaded)[:80]:
+                p = params_dict[u]
+                try:
+                    p_shape = tuple(p.shape)
+                    p_dtype = p.dtype
+                    p_allzero = bool((p.data == 0).all()) if p.numel() > 0 else "empty"
+                except RuntimeError:
+                    p_shape = "uninitialized"
+                    p_dtype = "uninitialized"
+                    p_allzero = "uninitialized"
+                logger.warning("  UNLOADED: %s  shape=%s dtype=%s allzero=%s",
+                               u, p_shape, p_dtype, p_allzero)
+            if len(unloaded) > 80:
+                logger.warning("  ... and %d more", len(unloaded) - 80)
+        else:
+            logger.warning("=== ALL %d PARAMS LOADED ===", len(all_param_names))
+        logger.warning("=== loaded_params count: %d ===", len(loaded_params))
+        # --- end diagnostic ---
+
         return loaded_params
 
     @classmethod

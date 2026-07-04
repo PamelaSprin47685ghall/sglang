@@ -366,11 +366,23 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
             )
-            if is_npu() or is_cpu():
-                last_recurrent_state = last_recurrent_state.to(
-                    ssm_states.dtype, copy=False
-                )
-                ssm_states[cache_indices] = last_recurrent_state
+            # Reconstruct last_recurrent_state if it is None (which happens on CUDA GPU)
+            if last_recurrent_state is None:
+                chunk_size = globals().get("FLA_CHUNK_SIZE", 64)
+                h_squeezed = h.squeeze(0)
+                extend_seq_lens = forward_batch.extend_seq_lens.cpu()
+                num_h_states = (extend_seq_lens - 1) // chunk_size + 1
+                track_ssm_src_offset = torch.zeros_like(num_h_states)
+                track_ssm_src_offset[1:] = torch.cumsum(num_h_states[:-1], dim=0)
+                last_chunk_indices = track_ssm_src_offset + num_h_states - 1
+                last_chunk_indices = last_chunk_indices.to(h.device)
+                last_recurrent_state = h_squeezed[last_chunk_indices]
+
+            # Always copy last_recurrent_state to ssm_states[cache_indices]
+            last_recurrent_state = last_recurrent_state.to(
+                ssm_states.dtype, copy=False
+            )
+            ssm_states[cache_indices] = last_recurrent_state
 
             self._track_mamba_state_extend(
                 forward_batch, h, ssm_states, forward_metadata

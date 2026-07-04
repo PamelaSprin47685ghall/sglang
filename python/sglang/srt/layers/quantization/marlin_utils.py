@@ -52,6 +52,22 @@ ScalarType, scalar_types = get_scalar_types()
 GPTQ_MARLIN_TILE = 16
 GPTQ_MARLIN_MIN_THREAD_N = 64
 GPTQ_MARLIN_MIN_THREAD_K = 128
+
+
+def marlin_pad_n_for_repack(size_n: int) -> int:
+    """Repack kernel tile_n=64; logical N&lt;64 (e.g. GDN in_proj_a/b=32) pads with zeros."""
+    if size_n <= 0:
+        return GPTQ_MARLIN_MIN_THREAD_N
+    pad = GPTQ_MARLIN_MIN_THREAD_N
+    return ((size_n + pad - 1) // pad) * pad
+
+
+def marlin_slice_n_output(tensor: torch.Tensor, logical_n: int) -> torch.Tensor:
+    if logical_n <= 0:
+        return tensor
+    if tensor.shape[-1] == logical_n:
+        return tensor
+    return tensor[..., :logical_n].contiguous()
 GPTQ_MARLIN_MAX_PARALLEL = 16
 
 MARLIN_SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128]

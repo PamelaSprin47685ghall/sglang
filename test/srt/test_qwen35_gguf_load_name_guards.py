@@ -36,18 +36,22 @@ _STACKED_PARAMS_MAPPING = [
 ]
 
 
-def _simulate_stacked_rewrite(name: str) -> str:
-    """Apply stacked_params_mapping string-rewrite *with* the skip guard.
+def _shard_in_name(name: str, weight_name: str) -> bool:
+    needle = f".{weight_name}."
+    return needle in name or name.endswith(f".{weight_name}")
 
-    Mirrors load_weights: first matching shard replaces once, then break
-    (avoids k_proj matching inside qkv_proj, up_proj inside gate_up_proj).
-    """
+
+def _simulate_stacked_rewrite(name: str) -> str:
+    """Apply stacked_params_mapping string-rewrite *with* the skip guard."""
     for param_name, weight_name, _shard_id in _STACKED_PARAMS_MAPPING:
-        if weight_name not in name:
+        if not _shard_in_name(name, weight_name):
             continue
         if _should_skip_stacked_rewrite(name):
             return name
-        return name.replace(weight_name, param_name, 1)
+        needle = f".{weight_name}."
+        if needle in name:
+            return name.replace(needle, f".{param_name}.", 1)
+        return name.replace(f".{weight_name}", f".{param_name}", 1)
     return name
 
 
@@ -100,6 +104,18 @@ def test_rewrite_q_proj():
     n = "model.layers.3.self_attn.q_proj.weight"
     assert not _should_skip_stacked_rewrite(n)
     assert _simulate_stacked_rewrite(n) == "model.layers.3.self_attn.qkv_proj.weight"
+
+
+def test_rewrite_q_proj_does_not_double_replace_inside_qkv():
+    n = "model.layers.11.self_attn.q_proj.weight"
+    out = _simulate_stacked_rewrite(n)
+    assert out == "model.layers.11.self_attn.qkv_proj.weight"
+    assert "qkqkv" not in out
+
+
+def test_k_proj_does_not_match_inside_qkv_proj_string():
+    n = "model.layers.11.self_attn.qkv_proj.weight_packed"
+    assert _simulate_stacked_rewrite(n) == n
 
 
 # ── edge cases ────────────────────────────────────────────────────────────

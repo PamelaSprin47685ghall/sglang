@@ -9,7 +9,6 @@ from sglang.jit_kernel.utils import cache_once, load_jit
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-# Constants matching device::marlin:: in marlin.cuh
 _TILE_SIZE = 16
 
 
@@ -22,7 +21,7 @@ def _jit_gptq_marlin_repack_module() -> Module:
     )
 
 
-def gptq_marlin_repack(
+def _gptq_marlin_repack_aligned(
     b_q_weight: torch.Tensor,
     perm: torch.Tensor,
     size_k: int,
@@ -30,14 +29,33 @@ def gptq_marlin_repack(
     num_bits: int,
 ) -> torch.Tensor:
     pack_factor = 32 // num_bits
-
-    # Allocate output tensor
     out = torch.empty(
         (size_k // _TILE_SIZE, size_n * _TILE_SIZE // pack_factor),
         dtype=b_q_weight.dtype,
         device=b_q_weight.device,
     )
-
     module = _jit_gptq_marlin_repack_module()
     module.gptq_marlin_repack(b_q_weight, perm, out, size_k, size_n, num_bits)
     return out
+
+
+def gptq_marlin_repack(
+    b_q_weight: torch.Tensor,
+    perm: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    num_bits: int,
+) -> torch.Tensor:
+    if size_n % 64 == 0:
+        return _gptq_marlin_repack_aligned(
+            b_q_weight, perm, size_k, size_n, num_bits
+        )
+
+    from sglang.srt.layers.quantization.marlin_utils import marlin_pad_n_for_repack
+
+    size_n_pad = marlin_pad_n_for_repack(size_n)
+    pad_cols = size_n_pad - size_n
+    b_pad = torch.nn.functional.pad(b_q_weight, (0, pad_cols, 0, 0))  # pad N cols
+    return _gptq_marlin_repack_aligned(
+        b_pad, perm, size_k, size_n_pad, num_bits
+    )

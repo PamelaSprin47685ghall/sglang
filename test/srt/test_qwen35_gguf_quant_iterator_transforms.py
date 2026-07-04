@@ -41,7 +41,7 @@ def test_dequant_apply_matches_dim1_export_on_loader_layout_in_proj_qkv():
     hidden, lead = 2048, key_dim * 2 + value_dim
     hf = "model.layers.0.linear_attn.in_proj_qkv.weight"
     logical = torch.randn(hidden, lead)
-    dequant_rows = logical.reshape(-1).reshape(lead, hidden).contiguous()
+    dequant_rows = logical.t().contiguous()
     ref = apply_gguf_to_hf_weight(logical.clone(), hf, cfg)
     got = qwen35_gguf_dequant_apply_for_load(dequant_rows.clone(), hf, cfg)
     assert torch.allclose(got, ref, atol=1e-5, rtol=1e-5)
@@ -80,12 +80,13 @@ def test_on_the_fly_skips_out_proj_runtime_perm_path():
 
 def test_out_proj_q6k_dequant_meta_layout_matches_export():
     import gguf as gguf_mod
-    from sglang.srt.model_loader.gguf_qwen35moe import qwen35_gguf_dequant_from_reader_tensor
+    from sglang.srt.model_loader.gguf_qwen35moe import qwen35_gguf_dequant_from_reader_tensor, get_out_proj_activation_perm
 
     path = "/home/kunweiz/Desktop/Ornith/ornith-gguf-runtime/ornith-gpu-non-expert.gguf"
     t = next(x for x in gguf_mod.GGUFReader(path).tensors if x.name == "blk.0.ssm_out.weight")
-    dense = qwen35_gguf_dequant_from_reader_tensor(t)
-    w = dense.reshape(tuple(int(x) for x in t.shape)).float()
+    dense = qwen35_gguf_dequant_from_reader_tensor(t).float()
+    perm = get_out_proj_activation_perm(2, 16, 128)
+    w = dense[:, perm].contiguous()
     exp_key = "model.language_model.layers.0.linear_attn.out_proj.weight"
     with safe_open(
         "/home/kunweiz/Desktop/Ornith/ornith-gpu-bf16-from-gguf/model-gpu-from-gguf.safetensors",

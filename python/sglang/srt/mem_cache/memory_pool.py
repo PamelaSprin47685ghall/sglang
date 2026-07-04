@@ -59,6 +59,7 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     next_power_of_2,
+    is_float4_e2m1fn_x2,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -1214,8 +1215,10 @@ class HybridLinearKVPool(KVCache):
         assert not enable_kvcache_transpose
         self.use_mla = use_mla
         if not use_mla:
-
-            TokenToKVPoolClass = MHATokenToKVPool
+            if is_float4_e2m1fn_x2(dtype):
+                TokenToKVPoolClass = MHATokenToKVPoolFP4
+            else:
+                TokenToKVPoolClass = MHATokenToKVPool
 
             if _is_npu:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
@@ -1235,8 +1238,10 @@ class HybridLinearKVPool(KVCache):
                 enable_memory_saver=enable_memory_saver,
             )
         else:
-
-            TokenToKVPoolClass = MLATokenToKVPool
+            if is_float4_e2m1fn_x2(dtype):
+                TokenToKVPoolClass = MLATokenToKVPoolFP4
+            else:
+                TokenToKVPoolClass = MLATokenToKVPool
 
             if _is_npu:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (

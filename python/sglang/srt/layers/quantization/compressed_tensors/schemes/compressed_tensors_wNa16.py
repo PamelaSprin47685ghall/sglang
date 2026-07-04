@@ -28,8 +28,10 @@ from sglang.srt.layers.quantization.marlin_utils import (
     marlin_is_k_full,
     marlin_make_empty_g_idx,
     marlin_make_workspace,
+    marlin_pad_n_for_repack,
     marlin_permute_scales,
     marlin_repeat_scales_on_all_ranks,
+    marlin_slice_n_output,
     marlin_sort_g_idx,
     marlin_zero_points,
 )
@@ -215,7 +217,14 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         device = getattr(layer, self.w_q_name).device
         c = self.kernel_config
         layer_name = getattr(layer, "layer_name", "?")
-        logger.warning(f"Marlin repack: layer={layer_name} size_k={c.partition_weight_shape[0]} size_n={c.partition_weight_shape[1]} bits={c.weight_type.size_bits}")        
+        logical_n = c.partition_weight_shape[1]
+        padded_n = marlin_pad_n_for_repack(logical_n)
+        if padded_n != logical_n:
+            layer._marlin_logical_output_features = logical_n
+        logger.warning(
+            f"Marlin repack: layer={layer_name} size_k={c.partition_weight_shape[0]} "
+            f"size_n={logical_n} padded_n={padded_n} bits={c.weight_type.size_bits}"
+        )
 
         row_parallel = c.partition_weight_shape[0] != c.full_weight_shape[0]
         self.is_k_full = marlin_is_k_full(c.has_g_idx, row_parallel)
@@ -239,11 +248,15 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         def transform_w_q(x):
             assert isinstance(x, BasevLLMParameter)
             permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=0)
+            w = x.data.contiguous()
+            if padded_n > logical_n:
+                # F.pad 2D: (left, right, top, bottom) → pad output dim (cols / N)
+                w = torch.nn.functional.pad(w, (0, padded_n - logical_n, 0, 0))
             x.data = gptq_marlin_repack(
-                x.data.contiguous(),
+                w,
                 perm=layer.g_idx_sort_indices,
                 size_k=c.partition_weight_shape[0],
-                size_n=c.partition_weight_shape[1],
+                size_n=padded_n,
                 num_bits=c.weight_type.size_bits,
             )
             return x
@@ -251,10 +264,13 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         def transform_w_s(x):
             assert isinstance(x, BasevLLMParameter)
             permute_param_layout_(x, input_dim=0, output_dim=1)
+            s = x.data.contiguous()
+            if padded_n > logical_n:
+                s = torch.nn.functional.pad(s, (0, padded_n - logical_n, 0, 0))
             x.data = marlin_permute_scales(
-                x.data.contiguous(),
+                s,
                 size_k=c.partition_weight_shape[0],
-                size_n=c.partition_weight_shape[1],
+                size_n=padded_n,
                 group_size=c.group_size,
             )
             return x
@@ -314,9 +330,12 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
 
         w_q, w_s, w_zp, w_gidx = _get_weight_params(layer)
 
-        # `process_weights_after_loading` will ensure w_zp and w_gidx are not
-        #  None for marlin
-        return apply_gptq_marlin_linear(
+        logical_n = getattr(
+            layer, "_marlin_logical_output_features", c.partition_weight_shape[1]
+        )
+        gemm_n = marlin_pad_n_for_repack(logical_n)
+
+        out = apply_gptq_marlin_linear(
             input=x,
             weight=w_q,
             weight_scale=w_s,
@@ -326,7 +345,8 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             workspace=self.workspace,
             wtype=c.weight_type,
             input_size_per_partition=c.partition_weight_shape[0],
-            output_size_per_partition=c.partition_weight_shape[1],
+            output_size_per_partition=gemm_n,
             is_k_full=self.is_k_full,
             bias=bias,
         )
+        return marlin_slice_n_output(out, logical_n)
